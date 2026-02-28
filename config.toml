@@ -1,8 +1,8 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "sol-v1"      # Solution name
+definition = "gated_delta_net"          # Track: fused_moe | sparse_attention | gated_delta_net
+author = "kachua"              # Team/author name
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "cuda"               # triton | cuda
+entry_point = "gdn_v1"            # Kernel function name

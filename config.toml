@@ -1,8 +1,8 @@
 [solution]
 name = "sol-v1"      # Solution name
-definition = "gated_delta_net"          # Track: fused_moe | sparse_attention | gated_delta_net
+definition = "gdn_decode_qk4_v8_d128_k_last"          # Concrete definition key from trace set
 author = "kachua"              # Team/author name
 
 [build]
 language = "cuda"               # triton | cuda
-entry_point = "gdn_v1"            # Kernel function name
+entry_point = "binding.py::kernel"            # Entry point: <file_path>::<function_name>

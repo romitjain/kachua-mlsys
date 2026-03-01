@@ -12,7 +12,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.cpp_extension import load
-# from tvm.ffi import register_func
+
+from tvm_ffi import register_global_func as register_func
 
 _EXTENSION_MODULE = None
 
@@ -29,7 +30,7 @@ def _load_extension():
         )
     return _EXTENSION_MODULE
 
-# @register_func("flashinfer.kernel")
+@register_func("flashinfer.kernel")
 def kernel(q, k, v, state, A_log, a, dt_bias, b, scale=None):
     """
     Python binding for your CUDA kernel.
@@ -97,11 +98,6 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     # Minimal speed check
-
-    # def tflops(ms):
-    #     flop = 2.0 * B * M * N * K
-    #     return flop * 1e-12 / (ms * 1e-3)
-
     quantiles = [0.5, 0.2, 0.8]
 
     ms, min_ms, max_ms = triton.testing.do_bench(

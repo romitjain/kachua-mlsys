@@ -161,7 +161,7 @@ extern "C" cudaError_t launch_gdn_v1(
     dim3 threads_per_block(32, split_v);
     dim3 grid_size(B, num_v_heads, (V+split_v-1)/split_v);
 
-    gdn_v1<<<grid_size, threads_per_block>>>(
+    gdn_v1<<<grid_size, threads_per_block, 0, stream>>>(
         q,
         k,
         v,
@@ -223,6 +223,7 @@ int main() {
     cudaMallocManaged(&out, out_elems * sizeof(float));
     cudaMallocManaged(&new_state, state_elems * sizeof(float));
 
+    for (size_t i = 0; i < q_elems; ++i) q[i] = (0.01f * static_cast<float>(i % 17));
     for (size_t i = 0; i < k_elems; ++i) k[i] = (0.02f * static_cast<float>(i % 13));
     for (size_t i = 0; i < v_elems; ++i) v[i] = (0.03f * static_cast<float>(i % 11));
     for (size_t i = 0; i < state_elems; ++i) {
@@ -294,29 +295,21 @@ void launch_gdn_v1_torch(
     double scale
 ) {
     const int B = static_cast<int>(q.size(0));
-    const int T = static_cast<int>(q.size(1));
-    const int num_q_heads = static_cast<int>(q.size(2));
     const int num_k_heads = static_cast<int>(k.size(2));
     const int num_v_heads = static_cast<int>(v.size(2));
     const int K = static_cast<int>(q.size(3));
     const int V = static_cast<int>(v.size(3));
 
-    torch::Tensor A_log_f32 = A_log.scalar_type() == torch::kFloat32 ? A_log : A_log.to(torch::kFloat32);
-    torch::Tensor a_f32 = a.scalar_type() == torch::kFloat32 ? a : a.to(torch::kFloat32);
-    torch::Tensor dt_bias_f32 =
-        dt_bias.scalar_type() == torch::kFloat32 ? dt_bias : dt_bias.to(torch::kFloat32);
-    torch::Tensor b_f32 = b.scalar_type() == torch::kFloat32 ? b : b.to(torch::kFloat32);
-
     const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
     (void)launch_gdn_v1(
-        q.data_ptr(),
-        k.data_ptr(),
-        v.data_ptr(),
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
         state.data_ptr<float>(),
-        A_log_f32.data_ptr<float>(),
-        a_f32.data_ptr<float>(),
-        dt_bias_f32.data_ptr<float>(),
-        b_f32.data_ptr<float>(),
+        A_log.data_ptr<float>(),
+        a.data_ptr<float>(),
+        dt_bias.data_ptr<float>(),
+        b.data_ptr<float>(),
         out.data_ptr<float>(),
         new_state.data_ptr<float>(),
         B,

@@ -5,4 +5,5 @@ author = "kachua"              # Team/author name
 
 [build]
 language = "cuda"               # triton | cuda
-entry_point = "binding.py::kernel"            # Entry point: <file_path>::<function_name>
+binding = "torch"               # tvm-ffi | torch (for CUDA/CPP)
+entry_point = "kernel.cu::launch_gdn_v1"  # Entry point: <file_path>::<function_name>

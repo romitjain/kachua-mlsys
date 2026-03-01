@@ -26,9 +26,38 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("build-essential", "ninja-build")
+    .run_commands(
+        "python -m pip install --upgrade pip",
+        (
+            "python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 "
+            "torch flashinfer-bench triton numpy"
+        ),
+    )
 )
+
+
+def _is_trace_root(path: Path) -> bool:
+    """Return True if path looks like a flashinfer trace-set root."""
+    return (path / "definitions").is_dir() and (path / "workloads").is_dir()
+
+
+def _resolve_trace_set_path(base_path: str) -> Path:
+    """Resolve mounted trace-set root (supports /data or /data/<dataset_dir>)."""
+    base = Path(base_path)
+    if _is_trace_root(base):
+        return base
+
+    for child in sorted(base.iterdir()):
+        if child.is_dir() and _is_trace_root(child):
+            return child
+
+    raise FileNotFoundError(
+        f"Could not find flashinfer trace-set under '{base}'. "
+        "Expected 'definitions/' and 'workloads/' either at mount root "
+        "or one level below it."
+    )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
@@ -37,10 +66,15 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    trace_set_path = _resolve_trace_set_path(TRACE_SET_PATH)
+    trace_set = TraceSet.from_path(trace_set_path)
 
     if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+        available = ", ".join(sorted(trace_set.definitions))
+        raise ValueError(
+            f"Definition '{solution.definition}' not found in trace set at '{trace_set_path}'. "
+            f"Available definitions: {available or '<none>'}"
+        )
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])

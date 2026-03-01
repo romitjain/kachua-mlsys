@@ -43,13 +43,13 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale=None):
     else:
         scale = float(scale)
 
-    out_fp32 = torch.empty((B, num_v_heads, V), dtype=torch.float32, device=q.device)
+    out = torch.empty((B, num_v_heads, V), dtype=torch.float32, device=q.device)
     new_state = torch.empty_like(state)
 
     ext = _load_extension()
-    ext.launch_gdn_v1(q, k, v, state, A_log, a, dt_bias, b, out_fp32, new_state, scale) # type: ignore
+    ext.launch_gdn_v1(q, k, v, state, A_log, a, dt_bias, b, scale, out, new_state)  # type: ignore
 
-    return out_fp32, new_state
+    return out, new_state
 
 if __name__ == "__main__":
     """

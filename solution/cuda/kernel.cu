@@ -290,36 +290,49 @@ void launch_gdn_v1_torch(
     torch::Tensor a,
     torch::Tensor dt_bias,
     torch::Tensor b,
+    float scale,
     torch::Tensor out,
-    torch::Tensor new_state,
-    double scale
+    torch::Tensor new_state
 ) {
-    const int B = static_cast<int>(q.size(0));
-    const int num_k_heads = static_cast<int>(k.size(2));
-    const int num_v_heads = static_cast<int>(v.size(2));
-    const int K = static_cast<int>(q.size(3));
-    const int V = static_cast<int>(v.size(3));
+    auto q_f32 = (q.scalar_type() == torch::kFloat32) ? q : q.to(torch::kFloat32);
+    auto k_f32 = (k.scalar_type() == torch::kFloat32) ? k : k.to(torch::kFloat32);
+    auto v_f32 = (v.scalar_type() == torch::kFloat32) ? v : v.to(torch::kFloat32);
+    auto a_f32 = (a.scalar_type() == torch::kFloat32) ? a : a.to(torch::kFloat32);
+    auto b_f32 = (b.scalar_type() == torch::kFloat32) ? b : b.to(torch::kFloat32);
 
-    const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    const bool cast_out = out.scalar_type() != torch::kFloat32;
+    auto out_f32 = cast_out ? torch::empty(out.sizes(), out.options().dtype(torch::kFloat32)) : out;
+
+    const int B = static_cast<int>(q_f32.size(0));
+    const int num_k_heads = static_cast<int>(k_f32.size(2));
+    const int num_v_heads = static_cast<int>(v_f32.size(2));
+    const int K = static_cast<int>(q_f32.size(3));
+    const int V = static_cast<int>(v_f32.size(3));
+
+    const auto stream = at::cuda::getCurrentCUDAStream(q_f32.get_device());
     (void)launch_gdn_v1(
-        q.data_ptr<float>(),
-        k.data_ptr<float>(),
-        v.data_ptr<float>(),
+        q_f32.data_ptr<float>(),
+        k_f32.data_ptr<float>(),
+        v_f32.data_ptr<float>(),
         state.data_ptr<float>(),
         A_log.data_ptr<float>(),
-        a.data_ptr<float>(),
+        a_f32.data_ptr<float>(),
         dt_bias.data_ptr<float>(),
-        b.data_ptr<float>(),
-        out.data_ptr<float>(),
+        b_f32.data_ptr<float>(),
+        out_f32.data_ptr<float>(),
         new_state.data_ptr<float>(),
         B,
         num_v_heads,
         num_k_heads,
         K,
         V,
-        static_cast<float>(scale),
+        scale,
         stream.stream()
     );
+
+    if (cast_out) {
+        out.copy_(out_f32.to(out.scalar_type()));
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

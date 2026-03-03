@@ -83,3 +83,4 @@ Stopping app - local entrypoint completed.
 - Remove HMEM<>SMEM load for state
 - SMEM for V and K
 - float4 loads
+- Remove the slowdowns I introduced in v1 (OLD__V and NEW_V in SMEM, beta and gate values stored in SMEM instead of registers)

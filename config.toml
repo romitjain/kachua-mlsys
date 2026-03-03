@@ -1,5 +1,5 @@
 [solution]
-name = "sol-v1"      # Solution name
+name = "gdn-decode-cuda-v2"      # Solution name
 definition = "gdn_decode_qk4_v8_d128_k_last"          # Concrete definition key from trace set
 author = "kachua"              # Team/author name
 

@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cmath>
 
+constexpr int kSplitV = 16;
+
 __device__ __forceinline__ float sigmoid(float x) {
     // Stable sigmoid
     if (x >= 0.0f) {
@@ -128,6 +130,104 @@ __global__ void gdn_v1(
     }
 }
 
+__global__ void gdn_v2(
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const float *__restrict__ state,
+    const float *__restrict__ A_log,
+    const __nv_bfloat16 *__restrict__ a,
+    const float *__restrict__ dt_bias,
+    const __nv_bfloat16 *__restrict__ b,
+    __nv_bfloat16 *__restrict__ out,
+    float *__restrict__ new_state,
+    int B,
+    int num_v_heads,
+    int num_k_heads,
+    int K,
+    int V,
+    float scale
+) {
+    int common_scalar_offset = num_v_heads*blockIdx.x + blockIdx.y;
+    int qk_head_factor = num_v_heads/num_k_heads;
+
+    float gate;
+    float beta;
+
+    if (threadIdx.x == 0) {
+        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
+        gate = expf(-expf(A_log[common_scalar_offset]) * log1pf(expf(x)));
+        beta = sigmoid(__bfloat162float(b[common_scalar_offset]));
+    }
+
+    gate = __shfl_sync(0xffffffff, gate, 0);
+    beta = __shfl_sync(0xffffffff, beta, 0);
+
+    int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
+    int v_offset = common_scalar_offset*V;
+    // Get the read offset for state matrix (global)
+    // State matrix is BxHxVxK, we want VxK for every batch,head combination
+    int state_read_go = common_scalar_offset*V*K;
+    // Read offset for state matrix (local)
+    int local_v = blockIdx.z*kSplitV + threadIdx.y;
+    int state_read_lo = local_v*K;
+
+    float old_v_accum = 0.0f;
+    float k_cache[4];
+    int i = 0;
+
+# pragma unroll
+    // Vector matmul b/w state and k
+    for (int k0=0;k0<K;k0+=32) {
+        int local_k = k0+threadIdx.x;
+        float s = state[state_read_go+state_read_lo+local_k];
+        k_cache[i] = __bfloat162float(k[k_offset+local_k]);
+        old_v_accum += gate*s * k_cache[i];
+        i += 1;
+    }
+
+# pragma unroll
+    // Warp reduction
+    for (int off = 16; off > 0; off >>= 1) {
+        old_v_accum += __shfl_down_sync(0xffffffff, old_v_accum, off);
+    }
+
+    float old_v = __shfl_sync(0xffffffff, old_v_accum, 0);
+    float new_v = 0.0f;
+    if (threadIdx.x == 0) {
+        new_v = beta * __bfloat162float(v[v_offset + local_v]) + (1.0f - beta) * old_v;
+    }
+    new_v = __shfl_sync(0xffffffff, new_v, 0);
+
+    float out_acc = 0.0f;
+
+# pragma unroll
+    i = 0;
+    // Updated state computation and write back
+    for (int k0=0; k0<K ;k0+=32) {
+        int local_k = k0+threadIdx.x;
+        float s = state[state_read_go+state_read_lo+local_k];
+        float val = gate*s - old_v*k_cache[i] + new_v*k_cache[i];
+
+        new_state[state_read_go+state_read_lo+local_k] = val;
+        out_acc += scale * val * __bfloat162float(q[k_offset+local_k]);
+
+        i += 1;
+    }
+
+# pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        out_acc += __shfl_down_sync(0xffffffff, out_acc, off);
+    }
+
+    // Write out
+    if (threadIdx.x == 0) {
+        // if (local_v < V) {
+        out[v_offset+local_v] = __float2bfloat16_rn(out_acc);
+        // }
+    }
+}
+
 extern "C" cudaError_t launch_gdn(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
@@ -148,12 +248,10 @@ extern "C" cudaError_t launch_gdn(
     cudaStream_t stream
 ) {
 
-    // V dim is split into these many blocks
-    int split_v = 16;
-    dim3 threads_per_block(32, split_v);
-    dim3 grid_size(B, num_v_heads, (V+split_v-1)/split_v);
+    dim3 threads_per_block(32, kSplitV);
+    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
 
-    gdn_v1<<<grid_size, threads_per_block, 0, stream>>>(
+    gdn_v2<<<grid_size, threads_per_block, 0, stream>>>(
         q,
         k,
         v,
@@ -169,8 +267,7 @@ extern "C" cudaError_t launch_gdn(
         num_k_heads,
         K,
         V,
-        scale,
-        split_v
+        scale
     );
     return cudaGetLastError();
 }

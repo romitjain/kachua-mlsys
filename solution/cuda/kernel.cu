@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cstddef>
 #include <cmath>
@@ -30,15 +31,15 @@ __device__ __forceinline__ float sigmoid(float x) {
 }
 
 __global__ void gdn_v1(
-    const float *__restrict__ q,
-    const float *__restrict__ k,
-    const float *__restrict__ v,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
     const float *__restrict__ state,
     const float *__restrict__ A_log,
-    const float *__restrict__ a,
+    const __nv_bfloat16 *__restrict__ a,
     const float *__restrict__ dt_bias,
-    const float *__restrict__ b,
-    float *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ b,
+    __nv_bfloat16 *__restrict__ out,
     float *__restrict__ new_state,
     int B,
     int num_v_heads,
@@ -54,18 +55,18 @@ __global__ void gdn_v1(
     int qk_head_factor = num_v_heads/num_k_heads;
 
     if ((threadIdx.x == 0) && (threadIdx.y == 0)) {
-        float x = a[common_scalar_offset] + dt_bias[common_scalar_offset];
+        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
         gate_s = expf(-expf(A_log[common_scalar_offset]) * log1pf(expf(x)));
-        beta_s = sigmoid(b[common_scalar_offset]);
+        beta_s = sigmoid(__bfloat162float(b[common_scalar_offset]));
     }
     __syncthreads();
 
     float gate = gate_s;
     float beta = beta_s;
 
-    __shared__ float STATE[8][32];
-    __shared__ float OLD_V[8]; // how to initialize to 0?
-    __shared__ float NEW_V[8];
+    __shared__ float STATE[16][32];
+    __shared__ float OLD_V[16]; // how to initialize to 0?
+    __shared__ float NEW_V[16];
 
     int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
     int v_offset = common_scalar_offset*V;
@@ -78,19 +79,17 @@ __global__ void gdn_v1(
 
     float old_v_accum = 0.0f;
 
+# pragma unroll
     // Vector matmul b/w state and k
     for (int k0=0;k0<K;k0+=32) {
         // HMEM <> SMEM for state tile
         int local_k = k0+threadIdx.x;
-        if (local_v<V and local_k<K) {
-            STATE[threadIdx.y][threadIdx.x] = state[state_read_go+state_read_lo+local_k];
-            old_v_accum += gate*STATE[threadIdx.y][threadIdx.x] * k[k_offset+local_k];
-        }
-        else {
-            STATE[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+
+        STATE[threadIdx.y][threadIdx.x] = state[state_read_go+state_read_lo+local_k];
+        old_v_accum += gate*STATE[threadIdx.y][threadIdx.x] * __bfloat162float(k[k_offset+local_k]);
     }
 
+# pragma unroll
     // Warp reduction
     for (int off = 16; off > 0; off >>= 1) {
         old_v_accum += __shfl_down_sync(0xffffffff, old_v_accum, off);
@@ -99,53 +98,46 @@ __global__ void gdn_v1(
     // v_new computation
     if (threadIdx.x == 0) {
         OLD_V[threadIdx.y] = old_v_accum;
-        if (local_v < V) {
-            NEW_V[threadIdx.y] = beta * v[v_offset + local_v] + (1.0f - beta) * old_v_accum;
-        } else {
-            NEW_V[threadIdx.y] = 0.0f;
-        }
+        NEW_V[threadIdx.y] = beta * __bfloat162float(v[v_offset + local_v]) + (1.0f - beta) * old_v_accum;
     }
-
-    __syncthreads();
 
     float out_acc = 0.0f;
 
+# pragma unroll
     // Updated state computation and write back
     for (int k0=0; k0<K ;k0+=32) {
         int local_k = k0+threadIdx.x;
-        if (local_v < V and local_k < K) {
-            float s = state[state_read_go+state_read_lo+local_k];
-            float kval = k[k_offset+local_k];
-            float val = gate*s - OLD_V[threadIdx.y] * kval + NEW_V[threadIdx.y] * kval;
+        float s = state[state_read_go+state_read_lo+local_k];
+        float kval = __bfloat162float(k[k_offset+local_k]);
+        float val = gate*s - OLD_V[threadIdx.y] * kval + NEW_V[threadIdx.y] * kval;
 
-            new_state[state_read_go+state_read_lo+local_k] = val;
-
-            out_acc += scale * val * q[k_offset+local_k];
-        }
+        new_state[state_read_go+state_read_lo+local_k] = val;
+        out_acc += scale * val * __bfloat162float(q[k_offset+local_k]);
     }
 
+# pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         out_acc += __shfl_down_sync(0xffffffff, out_acc, off);
     }
 
     // Write out
     if (threadIdx.x == 0) {
-        if (local_v < V) {
-            out[v_offset+local_v] = out_acc;
-        }
+        // if (local_v < V) {
+        out[v_offset+local_v] = __float2bfloat16_rn(out_acc);
+        // }
     }
 }
 
 extern "C" cudaError_t launch_gdn_v1(
-    const float* q,
-    const float* k,
-    const float* v,
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* k,
+    const __nv_bfloat16* v,
     const float* state,
     const float* A_log,
-    const float* a,
+    const __nv_bfloat16* a,
     const float* dt_bias,
-    const float* b,
-    float* out,
+    const __nv_bfloat16* b,
+    __nv_bfloat16* out,
     float* new_state,
     int B,
     int num_v_heads,
@@ -157,7 +149,7 @@ extern "C" cudaError_t launch_gdn_v1(
 ) {
 
     // V dim is split into these many blocks
-    int split_v = 8;
+    int split_v = 16;
     dim3 threads_per_block(32, split_v);
     dim3 grid_size(B, num_v_heads, (V+split_v-1)/split_v);
 
@@ -200,43 +192,43 @@ int main() {
     const size_t gate_elems = B * num_v_heads;
     const size_t out_elems = B * num_v_heads * V;
 
-    float* q = nullptr;
-    float* k = nullptr;
-    float* v = nullptr;
+    __nv_bfloat16* q = nullptr;
+    __nv_bfloat16* k = nullptr;
+    __nv_bfloat16* v = nullptr;
     float* state = nullptr;
     float* A_log = nullptr;
-    float* a = nullptr;
+    __nv_bfloat16* a = nullptr;
     float* dt_bias = nullptr;
-    float* b = nullptr;
-    float* out = nullptr;
+    __nv_bfloat16* b = nullptr;
+    __nv_bfloat16* out = nullptr;
     float* new_state = nullptr;
     const float scale = 1.0f / std::sqrt(static_cast<float>(K));
 
-    cudaMallocManaged(&q, q_elems * sizeof(float));
-    cudaMallocManaged(&k, k_elems * sizeof(float));
-    cudaMallocManaged(&v, v_elems * sizeof(float));
+    cudaMallocManaged(&q, q_elems * sizeof(__nv_bfloat16));
+    cudaMallocManaged(&k, k_elems * sizeof(__nv_bfloat16));
+    cudaMallocManaged(&v, v_elems * sizeof(__nv_bfloat16));
     cudaMallocManaged(&state, state_elems * sizeof(float));
     cudaMallocManaged(&A_log, gate_elems * sizeof(float));
-    cudaMallocManaged(&a, gate_elems * sizeof(float));
+    cudaMallocManaged(&a, gate_elems * sizeof(__nv_bfloat16));
     cudaMallocManaged(&dt_bias, gate_elems * sizeof(float));
-    cudaMallocManaged(&b, gate_elems * sizeof(float));
-    cudaMallocManaged(&out, out_elems * sizeof(float));
+    cudaMallocManaged(&b, gate_elems * sizeof(__nv_bfloat16));
+    cudaMallocManaged(&out, out_elems * sizeof(__nv_bfloat16));
     cudaMallocManaged(&new_state, state_elems * sizeof(float));
 
-    for (size_t i = 0; i < q_elems; ++i) q[i] = (0.01f * static_cast<float>(i % 17));
-    for (size_t i = 0; i < k_elems; ++i) k[i] = (0.02f * static_cast<float>(i % 13));
-    for (size_t i = 0; i < v_elems; ++i) v[i] = (0.03f * static_cast<float>(i % 11));
+    for (size_t i = 0; i < q_elems; ++i) q[i] = __float2bfloat16_rn(0.01f * static_cast<float>(i % 17));
+    for (size_t i = 0; i < k_elems; ++i) k[i] = __float2bfloat16_rn(0.02f * static_cast<float>(i % 13));
+    for (size_t i = 0; i < v_elems; ++i) v[i] = __float2bfloat16_rn(0.03f * static_cast<float>(i % 11));
     for (size_t i = 0; i < state_elems; ++i) {
         state[i] = 0.0f;
         new_state[i] = 0.0f;
     }
     for (size_t i = 0; i < gate_elems; ++i) {
         A_log[i] = -2.0f;
-        a[i] = 0.0f;
+        a[i] = __float2bfloat16_rn(0.0f);
         dt_bias[i] = 0.1f;
-        b[i] = 0.0f;
+        b[i] = __float2bfloat16_rn(0.0f);
     }
-    for (size_t i = 0; i < out_elems; ++i) out[i] = 0.0f;
+    for (size_t i = 0; i < out_elems; ++i) out[i] = __float2bfloat16_rn(0.0f);
 
     const cudaError_t launch_err = launch_gdn_v1(
         q,
@@ -294,32 +286,23 @@ void launch_gdn_v1_torch(
     torch::Tensor out,
     torch::Tensor new_state
 ) {
-    auto q_f32 = (q.scalar_type() == torch::kFloat32) ? q : q.to(torch::kFloat32);
-    auto k_f32 = (k.scalar_type() == torch::kFloat32) ? k : k.to(torch::kFloat32);
-    auto v_f32 = (v.scalar_type() == torch::kFloat32) ? v : v.to(torch::kFloat32);
-    auto a_f32 = (a.scalar_type() == torch::kFloat32) ? a : a.to(torch::kFloat32);
-    auto b_f32 = (b.scalar_type() == torch::kFloat32) ? b : b.to(torch::kFloat32);
+    const int B = static_cast<int>(q.size(0));
+    const int num_k_heads = static_cast<int>(k.size(2));
+    const int num_v_heads = static_cast<int>(v.size(2));
+    const int K = static_cast<int>(q.size(3));
+    const int V = static_cast<int>(v.size(3));
 
-    const bool cast_out = out.scalar_type() != torch::kFloat32;
-    auto out_f32 = cast_out ? torch::empty(out.sizes(), out.options().dtype(torch::kFloat32)) : out;
-
-    const int B = static_cast<int>(q_f32.size(0));
-    const int num_k_heads = static_cast<int>(k_f32.size(2));
-    const int num_v_heads = static_cast<int>(v_f32.size(2));
-    const int K = static_cast<int>(q_f32.size(3));
-    const int V = static_cast<int>(v_f32.size(3));
-
-    const auto stream = at::cuda::getCurrentCUDAStream(q_f32.get_device());
+    const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
     (void)launch_gdn_v1(
-        q_f32.data_ptr<float>(),
-        k_f32.data_ptr<float>(),
-        v_f32.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
         state.data_ptr<float>(),
         A_log.data_ptr<float>(),
-        a_f32.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
         dt_bias.data_ptr<float>(),
-        b_f32.data_ptr<float>(),
-        out_f32.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
         new_state.data_ptr<float>(),
         B,
         num_v_heads,
@@ -329,10 +312,6 @@ void launch_gdn_v1_torch(
         scale,
         stream.stream()
     );
-
-    if (cast_out) {
-        out.copy_(out_f32.to(out.scalar_type()));
-    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

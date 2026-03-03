@@ -43,7 +43,7 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale=None):
     else:
         scale = float(scale)
 
-    out = torch.empty((B, num_v_heads, V), dtype=torch.float32, device=q.device)
+    out = torch.empty((B, num_v_heads, V), dtype=torch.bfloat16, device=q.device)
     new_state = torch.empty_like(state)
 
     ext = _load_extension()

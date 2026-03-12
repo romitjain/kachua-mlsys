@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cmath>
 
+constexpr int kSplitV = 4;
+
 __device__ __forceinline__ float sigmoid(float x) {
     // Stable sigmoid
     if (x >= 0.0f) {
@@ -128,7 +130,106 @@ __global__ void gdn_v1(
     }
 }
 
-extern "C" cudaError_t launch_gdn_v1(
+__global__ void gdn_v2(
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const float *__restrict__ state,
+    const float *__restrict__ A_log,
+    const __nv_bfloat16 *__restrict__ a,
+    const float *__restrict__ dt_bias,
+    const __nv_bfloat16 *__restrict__ b,
+    __nv_bfloat16 *__restrict__ out,
+    float *__restrict__ new_state,
+    int B,
+    int num_v_heads,
+    int num_k_heads,
+    int K,
+    int V,
+    float scale
+) {
+    int common_scalar_offset = num_v_heads*blockIdx.x + blockIdx.y;
+    int qk_head_factor = num_v_heads/num_k_heads;
+
+    float gate;
+    float beta;
+
+    if (threadIdx.x == 0) {
+        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
+        gate = expf(-expf(A_log[common_scalar_offset]) * log1pf(expf(x)));
+        beta = sigmoid(__bfloat162float(b[common_scalar_offset]));
+    }
+
+    gate = __shfl_sync(0xffffffff, gate, 0);
+    beta = __shfl_sync(0xffffffff, beta, 0);
+
+    int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
+    int v_offset = common_scalar_offset*V;
+    int local_v = blockIdx.z*kSplitV + threadIdx.y;
+    // Get the read offset for state matrix (global)
+    // State matrix is BxHxVxK, we want VxK for every batch,head combination
+    int state_read = common_scalar_offset*V*K + local_v*K;
+
+    // Vector matmul b/w state and k
+    int local_k = threadIdx.x*4;
+    const float4 s4 = reinterpret_cast<const float4*> (&state[state_read+local_k])[0];
+
+    // For bf16 loads, I have to do more things
+    // Load 4 bf16 values, split in to float2 values
+    // (why cant I save to a single float4) - because the nv_bfloat162 gives me 2 pair of bfloat16
+    // hmm, if there was nv_bfloat164, then it would have been possible to convert to float4 directly
+    const nv_bfloat162* k_cache4 = reinterpret_cast<const nv_bfloat162*> (&k[k_offset+local_k]);
+    float2 k_cache01 = __bfloat1622float2(k_cache4[0]);
+    float2 k_cache02 = __bfloat1622float2(k_cache4[1]);
+
+    float old_v_accum = 0.0f;
+    old_v_accum += gate*s4.x*k_cache01.x;
+    old_v_accum += gate*s4.y*k_cache01.y;
+    old_v_accum += gate*s4.z*k_cache02.x;
+    old_v_accum += gate*s4.w*k_cache02.y;
+
+# pragma unroll
+    // Warp reduction
+    for (int off = 16; off > 0; off >>= 1) {
+        old_v_accum += __shfl_down_sync(0xffffffff, old_v_accum, off);
+    }
+
+    float old_v = __shfl_sync(0xffffffff, old_v_accum, 0);
+    float new_v = 0.0f;
+    if (threadIdx.x == 0) {
+        new_v = beta * __bfloat162float(v[v_offset + local_v]) + (1.0f - beta) * old_v;
+    }
+    new_v = __shfl_sync(0xffffffff, new_v, 0);
+
+    float valx = gate*s4.x - old_v*k_cache01.x + new_v*k_cache01.x;
+    float valy = gate*s4.y - old_v*k_cache01.y + new_v*k_cache01.y;
+    float valz = gate*s4.z - old_v*k_cache02.x + new_v*k_cache02.x;
+    float valw = gate*s4.w - old_v*k_cache02.y + new_v*k_cache02.y;
+
+    reinterpret_cast<float4*>(&new_state[state_read+local_k])[0] = make_float4(valx, valy, valz, valw);
+
+    const nv_bfloat162* q_cache4 = reinterpret_cast<const nv_bfloat162*> (&q[k_offset+local_k]);
+    float2 q_cache01 = __bfloat1622float2(q_cache4[0]);
+    float2 q_cache02 = __bfloat1622float2(q_cache4[1]);
+
+    float out_acc = 0.0f;
+    out_acc += scale * valx * q_cache01.x;
+    out_acc += scale * valy * q_cache01.y;
+    out_acc += scale * valz * q_cache02.x;
+    out_acc += scale * valw * q_cache02.y;
+
+# pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        out_acc += __shfl_down_sync(0xffffffff, out_acc, off);
+    }
+
+    // Write out
+    if (threadIdx.x == 0) {
+        out[v_offset+local_v] = __float2bfloat16_rn(out_acc);
+    }
+}
+
+extern "C" cudaError_t launch_gdn(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
@@ -148,12 +249,10 @@ extern "C" cudaError_t launch_gdn_v1(
     cudaStream_t stream
 ) {
 
-    // V dim is split into these many blocks
-    int split_v = 16;
-    dim3 threads_per_block(32, split_v);
-    dim3 grid_size(B, num_v_heads, (V+split_v-1)/split_v);
+    dim3 threads_per_block(32, kSplitV);
+    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
 
-    gdn_v1<<<grid_size, threads_per_block, 0, stream>>>(
+    gdn_v2<<<grid_size, threads_per_block, 0, stream>>>(
         q,
         k,
         v,
@@ -169,8 +268,7 @@ extern "C" cudaError_t launch_gdn_v1(
         num_k_heads,
         K,
         V,
-        scale,
-        split_v
+        scale
     );
     return cudaGetLastError();
 }
@@ -230,7 +328,7 @@ int main() {
     }
     for (size_t i = 0; i < out_elems; ++i) out[i] = __float2bfloat16_rn(0.0f);
 
-    const cudaError_t launch_err = launch_gdn_v1(
+    const cudaError_t launch_err = launch_gdn(
         q,
         k,
         v,
@@ -250,7 +348,7 @@ int main() {
         nullptr
     );
     if (launch_err != cudaSuccess) {
-        std::printf("launch_gdn_v1 failed: %s\n", cudaGetErrorString(launch_err));
+        std::printf("launch_gdn failed: %s\n", cudaGetErrorString(launch_err));
         return 1;
     }
     cudaDeviceSynchronize();
@@ -273,7 +371,7 @@ int main() {
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-void launch_gdn_v1_torch(
+void launch_gdn_torch(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -293,7 +391,7 @@ void launch_gdn_v1_torch(
     const int V = static_cast<int>(v.size(3));
 
     const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
-    (void)launch_gdn_v1(
+    (void)launch_gdn(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
@@ -315,6 +413,6 @@ void launch_gdn_v1_torch(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_gdn_v1", &launch_gdn_v1_torch, "Launch gdn_v1 CUDA kernel");
+    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn_v1 CUDA kernel");
 }
 #endif  // TORCH_EXTENSION_NAME

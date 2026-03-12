@@ -47,7 +47,7 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale=None):
     new_state = torch.empty_like(state)
 
     ext = _load_extension()
-    ext.launch_gdn_v1(q, k, v, state, A_log, a, dt_bias, b, scale, out, new_state)  # type: ignore
+    ext.launch_gdn(q, k, v, state, A_log, a, dt_bias, b, scale, out, new_state)  # type: ignore
 
     return out, new_state
 

@@ -27,16 +27,15 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("build-essential", "ninja-build")
-    .run_commands(
-        "python -m pip install --upgrade pip",
-        (
-            "python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 "
-            "torch flashinfer-bench triton numpy"
-        ),
+    .uv_pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "flashinfer-python",
+        "pandas",
+        "cupti-python",
     )
 )
-
 
 def _is_trace_root(path: Path) -> bool:
     """Return True if path looks like a flashinfer trace-set root."""

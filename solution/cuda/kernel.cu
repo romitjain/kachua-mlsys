@@ -165,26 +165,28 @@ __global__ void gdn_v2(
 
     int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
     int v_offset = common_scalar_offset*V;
+    int local_v = blockIdx.z*kSplitV + threadIdx.y;
     // Get the read offset for state matrix (global)
     // State matrix is BxHxVxK, we want VxK for every batch,head combination
-    int state_read_go = common_scalar_offset*V*K;
-    // Read offset for state matrix (local)
-    int local_v = blockIdx.z*kSplitV + threadIdx.y;
-    int state_read_lo = local_v*K;
+    int state_read = common_scalar_offset*V*K + local_v*K;
+
+    // Vector matmul b/w state and k
+    int local_k = threadIdx.x*4;
+    const float4 s4 = reinterpret_cast<const float4*> (&state[state_read+local_k])[0];
+
+    // For bf16 loads, I have to do more things
+    // Load 4 bf16 values, split in to float2 values
+    // (why cant I save to a single float4) - because the nv_bfloat162 gives me 2 pair of bfloat16
+    // hmm, if there was nv_bfloat164, then it would have been possible to convert to float4 directly
+    const nv_bfloat162* k_cache4 = reinterpret_cast<const nv_bfloat162*> (&k[k_offset+local_k]);
+    float2 k_cache01 = __bfloat1622float2(k_cache4[0]);
+    float2 k_cache02 = __bfloat1622float2(k_cache4[1]);
 
     float old_v_accum = 0.0f;
-    float k_cache[4];
-    int i = 0;
-
-# pragma unroll
-    // Vector matmul b/w state and k
-    for (int k0=0;k0<K;k0+=32) {
-        int local_k = k0+threadIdx.x;
-        float s = state[state_read_go+state_read_lo+local_k];
-        k_cache[i] = __bfloat162float(k[k_offset+local_k]);
-        old_v_accum += gate*s * k_cache[i];
-        i += 1;
-    }
+    old_v_accum += gate*s4.x*k_cache01.x;
+    old_v_accum += gate*s4.y*k_cache01.y;
+    old_v_accum += gate*s4.z*k_cache02.x;
+    old_v_accum += gate*s4.w*k_cache02.y;
 
 # pragma unroll
     // Warp reduction
@@ -199,21 +201,22 @@ __global__ void gdn_v2(
     }
     new_v = __shfl_sync(0xffffffff, new_v, 0);
 
+    float valx = gate*s4.x - old_v*k_cache01.x + new_v*k_cache01.x;
+    float valy = gate*s4.y - old_v*k_cache01.y + new_v*k_cache01.y;
+    float valz = gate*s4.z - old_v*k_cache02.x + new_v*k_cache02.x;
+    float valw = gate*s4.w - old_v*k_cache02.y + new_v*k_cache02.y;
+
+    reinterpret_cast<float4*>(&new_state[state_read+local_k])[0] = make_float4(valx, valy, valz, valw);
+
+    const nv_bfloat162* q_cache4 = reinterpret_cast<const nv_bfloat162*> (&q[k_offset+local_k]);
+    float2 q_cache01 = __bfloat1622float2(q_cache4[0]);
+    float2 q_cache02 = __bfloat1622float2(q_cache4[1]);
+
     float out_acc = 0.0f;
-
-# pragma unroll
-    i = 0;
-    // Updated state computation and write back
-    for (int k0=0; k0<K ;k0+=32) {
-        int local_k = k0+threadIdx.x;
-        float s = state[state_read_go+state_read_lo+local_k];
-        float val = gate*s - old_v*k_cache[i] + new_v*k_cache[i];
-
-        new_state[state_read_go+state_read_lo+local_k] = val;
-        out_acc += scale * val * __bfloat162float(q[k_offset+local_k]);
-
-        i += 1;
-    }
+    out_acc += scale * valx * q_cache01.x;
+    out_acc += scale * valy * q_cache01.y;
+    out_acc += scale * valz * q_cache02.x;
+    out_acc += scale * valw * q_cache02.y;
 
 # pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -222,9 +225,7 @@ __global__ void gdn_v2(
 
     // Write out
     if (threadIdx.x == 0) {
-        // if (local_v < V) {
         out[v_offset+local_v] = __float2bfloat16_rn(out_acc);
-        // }
     }
 }
 

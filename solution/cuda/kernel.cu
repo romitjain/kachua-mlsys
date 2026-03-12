@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <cmath>
 
-constexpr int kSplitV = 16;
+constexpr int kSplitV = 4;
 
 __device__ __forceinline__ float sigmoid(float x) {
     // Stable sigmoid

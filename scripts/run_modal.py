@@ -4,27 +4,21 @@ FlashInfer-Bench Modal Cloud Benchmark Runner.
 Automatically packs the solution from source files and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
 
-All flashinfer_bench imports happen on the remote Modal container (Linux + CUDA),
-so this script can be launched from macOS via `uv run modal run scripts/run_modal.py`.
-
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
-import modal
 import sys
 from pathlib import Path
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
-
+# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import modal
+from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
@@ -42,7 +36,6 @@ image = (
         "cupti-python",
     )
 )
-
 
 def _is_trace_root(path: Path) -> bool:
     """Return True if path looks like a flashinfer trace-set root."""
@@ -67,41 +60,10 @@ def _resolve_trace_set_path(base_path: str) -> Path:
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(source_files: dict, build_config: dict, solution_config: dict) -> dict:
-    """Pack solution + run benchmark on Modal B200.
-
-    All flashinfer_bench imports happen here (remote Linux container).
-    """
-    import tempfile
-
-    from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
-    from flashinfer_bench.agents import pack_solution_from_files
-
-    # Write source files to a temp directory and pack
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for fname, content in source_files.items():
-            fpath = Path(tmpdir) / fname
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            fpath.write_text(content)
-
-        spec = BuildSpec(
-            language=build_config["language"],
-            target_hardware=["cuda"],
-            entry_point=build_config["entry_point"],
-            binding=build_config.get("binding"),
-        )
-
-        solution = pack_solution_from_files(
-            path=tmpdir,
-            spec=spec,
-            name=solution_config["name"],
-            definition=solution_config["definition"],
-            author=solution_config["author"],
-        )
-
-    print(f"Packed: {solution.name} ({solution.definition})")
-
-    config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+    """Run benchmark on Modal B200 and return results."""
+    if config is None:
+        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
     trace_set_path = _resolve_trace_set_path(TRACE_SET_PATH)
     trace_set = TraceSet.from_path(trace_set_path)
@@ -148,7 +110,6 @@ def run_benchmark(source_files: dict, build_config: dict, solution_config: dict)
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
 
-    results["_solution_json"] = solution.model_dump_json(indent=2)
     return results
 
 
@@ -174,52 +135,23 @@ def print_results(results: dict):
             print()
 
 
-def _read_source_files(source_dir: Path) -> dict:
-    """Read all files from the source directory into a dict."""
-    source_files = {}
-    for f in sorted(source_dir.rglob("*")):
-        if f.is_file():
-            rel = str(f.relative_to(source_dir))
-            source_files[rel] = f.read_text()
-    return source_files
-
-
-LANGUAGE_DIRS = {"triton": "triton", "cuda": "cuda"}
-
-
 @app.local_entrypoint()
 def main():
-    """Read source files locally, pack + benchmark on Modal."""
-    config_path = PROJECT_ROOT / "config.toml"
-    with open(config_path, "rb") as f:
-        config = tomllib.load(f)
+    """Pack solution and run benchmark on Modal."""
+    from scripts.pack_solution import pack_solution
 
-    build_config = config["build"]
-    solution_config = config["solution"]
-    language = build_config["language"]
+    print("Packing solution from source files...")
+    solution_path = pack_solution()
 
-    dir_name = LANGUAGE_DIRS.get(language)
-    if dir_name is None:
-        raise ValueError(f"Unsupported language: {language}")
+    print("\nLoading solution...")
+    solution = Solution.model_validate_json(solution_path.read_text())
+    print(f"Loaded: {solution.name} ({solution.definition})")
 
-    source_dir = PROJECT_ROOT / "solution" / dir_name
-    if not source_dir.exists():
-        raise FileNotFoundError(f"Source directory not found: {source_dir}")
-
-    source_files = _read_source_files(source_dir)
-    print(f"Read {len(source_files)} files from solution/{dir_name}/")
-
-    print("\nRunning pack + benchmark on Modal B200...")
-    results = run_benchmark.remote(source_files, build_config, solution_config)
+    print("\nRunning benchmark on Modal B200...")
+    results = run_benchmark.remote(solution)
 
     if not results:
         print("No results returned!")
         return
-
-    solution_json = results.pop("_solution_json", None)
-    if solution_json:
-        output_path = PROJECT_ROOT / "solution.json"
-        output_path.write_text(solution_json)
-        print(f"\nSolution saved to {output_path}")
 
     print_results(results)

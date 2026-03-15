@@ -3,8 +3,7 @@
 Evolved from v1 naive baseline through 30 experiments on B200. Key changes:
 1. 3D grid (B, NUM_V_HEADS, V_DIM//BV) — parallelizes V-tile dimension.
 2. Block pointers via tl.make_block_ptr — TMA-eligible on Blackwell (sm100).
-3. CUDA graph replay — bypasses ~80us Python dispatch overhead on repeated calls.
-4. Tuned: num_warps=8, num_stages=4, BLOCK_V=16.
+3. Tuned: num_warps=8, num_stages=4, BLOCK_V=16.
 
 Best result: ~13.7x speedup (median) on Modal B200.
 """
@@ -22,10 +21,6 @@ NUM_V_HEADS: int = 8
 HEAD_DIM: int = 128
 GVA_RATIO: int = NUM_V_HEADS // NUM_Q_HEADS
 
-# Single-entry CUDA graph cache for dispatch bypass
-_CACHED_IDS = None
-_CACHED_GRAPH = None
-
 
 @register_func("flashinfer.kernel")
 def launch_gdn_v2(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
@@ -34,64 +29,34 @@ def launch_gdn_v2(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state
     The framework calls this as kernel(*inputs, *outputs), passing
     pre-allocated output tensors. Inputs arrive as tvm_ffi.core.Tensor
     and must be converted to PyTorch tensors via DLPack.
-
-    Uses CUDA graph replay on repeated calls with same tensor objects
-    to bypass Python dispatch overhead (~80us -> ~0.5us).
     """
-    global _CACHED_IDS, _CACHED_GRAPH
+    q = torch.from_dlpack(q)
+    k = torch.from_dlpack(k)
+    v = torch.from_dlpack(v)
+    state = torch.from_dlpack(state)
+    A_log = torch.from_dlpack(A_log)
+    a = torch.from_dlpack(a)
+    dt_bias = torch.from_dlpack(dt_bias)
+    b = torch.from_dlpack(b)
+    output = torch.from_dlpack(output)
+    new_state = torch.from_dlpack(new_state)
 
-    B = q.shape[0] if hasattr(q, "shape") else 1
-    grid = (B, NUM_V_HEADS, HEAD_DIM // 16)
-    f_scale = float(scale) if scale is not None else 0.0
-
-    # Fast path: replay cached CUDA graph when tensor objects are recycled
-    # (benchmark loop reuses the same Python wrappers across 100 iterations)
-    current_ids = (
-        id(q), id(k), id(v), id(state), id(A_log), id(a), id(dt_bias), id(b),
-        id(output), id(new_state), grid, f_scale
-    )
-    if current_ids == _CACHED_IDS:
-        _CACHED_GRAPH.replay()
-        return
-
-    # Slow path: first call or new workload — convert + capture graph
-    t_q = torch.from_dlpack(q)
-    t_k = torch.from_dlpack(k)
-    t_v = torch.from_dlpack(v)
-    t_state = torch.from_dlpack(state)
-    t_A_log = torch.from_dlpack(A_log)
-    t_a = torch.from_dlpack(a)
-    t_dt_bias = torch.from_dlpack(dt_bias)
-    t_b = torch.from_dlpack(b)
-    t_output = torch.from_dlpack(output)
-    t_new_state = torch.from_dlpack(new_state)
+    B = q.shape[0]
 
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(HEAD_DIM)
 
-    kernel_args = dict(
+    grid = (B, NUM_V_HEADS, HEAD_DIM // 16)
+
+    gdn_decode_kernel[grid](
+        q, k, v, state, A_log, a, dt_bias, b,
+        output, new_state,
+        scale,
         K=HEAD_DIM, V_DIM=HEAD_DIM,
         NUM_V_HEADS=NUM_V_HEADS, NUM_K_HEADS=NUM_K_HEADS,
         GVA_RATIO=GVA_RATIO, BLOCK_V=16,
         num_warps=8, num_stages=4,
     )
-    tensors = (
-        t_q, t_k, t_v, t_state, t_A_log, t_a, t_dt_bias, t_b,
-        t_output, t_new_state, scale,
-    )
-
-    # Warmup run outside graph capture (JIT compilation happens here)
-    g = torch.cuda.CUDAGraph()
-    s = torch.cuda.Stream()
-    with torch.cuda.stream(s):
-        gdn_decode_kernel[grid](*tensors, **kernel_args)
-        s.synchronize()
-        with torch.cuda.graph(g):
-            gdn_decode_kernel[grid](*tensors, **kernel_args)
-
-    _CACHED_IDS = current_ids
-    _CACHED_GRAPH = g
-    g.replay()
 
 
 @triton.jit

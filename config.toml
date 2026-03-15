@@ -1,9 +1,8 @@
 [solution]
-name = "gdn-decode-cuda-v2"      # Solution name
-definition = "gdn_decode_qk4_v8_d128_k_last"          # Concrete definition key from trace set
-author = "kachua"              # Team/author name
+name = "gdn-decode-triton-v2"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "kachua"
 
 [build]
-language = "cuda"               # triton | cuda
-binding = "torch"               # tvm-ffi | torch (for CUDA/CPP)
-entry_point = "kernel.cu::launch_gdn"  # Entry point: <file_path>::<function_name>
+language = "triton"
+entry_point = "kernel.py::launch_gdn_v2"

@@ -1,4 +1,4 @@
-# CUDA GDN Decode Kernel
+# Kernel.cu
 
 We need to read:
 
@@ -16,15 +16,16 @@ and write:
 
 | Kernel | Median Speedup | Median Latency | Per-run Medians | Range |
 |--------|---------------|----------------|-----------------|-------|
-| v1 (Romit) | 75x | 15 µs | 75x, 82x | 66-88x |
-| v2 (Romit) | 82x | 10 µs | 78x, 84x | 72-94x |
-| **v3 (Pushkar)** | **93x** | **12 µs** | **91x, 97x, 94x** | **86-110x** |
+| v1     | 75x           | 15 µs          | 75x, 82x       | 66-88x |
+| v2     | 82x           | 10 µs          | 78x, 84x       | 72-94x |
+| **v3** | **93x**       | **12 µs**      | **91x, 97x, 94x** | **86-110x** |
 
 v3 is ~13% faster than v2 and significantly more consistent.
 Triton v2 baseline: 13.73x (88.7 µs) — CUDA v3 is **6.8x faster than Triton** on wall-clock.
 Modal has ~20% run-to-run variance due to different B200 instances.
 
 ## Kernel 1
+
 - Across number of tokens (B*T)
 - T == 1
 - Each block:
@@ -61,7 +62,32 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload c40fb468...: PASSED | 0.017 ms | 65.94x speedup | abs_err=1.95e-03, rel_err=7.97e-02
 ```
 
+```bash
+gdn_decode_qk4_v8_d128_k_last:
+  Workload 6700a748...: PASSED | 0.016 ms | 83.51x speedup | abs_err=2.44e-04, rel_err=1.25e-02
+  Workload d66ae544...: PASSED | 0.016 ms | 80.61x speedup | abs_err=1.53e-05, rel_err=1.25e-01
+  Workload bf115ff9...: PASSED | 0.016 ms | 80.73x speedup | abs_err=9.77e-04, rel_err=9.15e-02
+  Workload 30bb1856...: PASSED | 0.016 ms | 81.52x speedup | abs_err=1.72e-05, rel_err=1.37e-01
+  Workload 48a5be68...: PASSED | 0.016 ms | 82.87x speedup | abs_err=1.56e-02, rel_err=4.26e-02
+  Workload 6f09252c...: PASSED | 0.016 ms | 83.16x speedup | abs_err=6.10e-05, rel_err=1.38e-02
+  Workload 1e4e5a87...: PASSED | 0.016 ms | 81.84x speedup | abs_err=1.95e-03, rel_err=5.29e-01
+  Workload 8e3e1aa6...: PASSED | 0.016 ms | 82.53x speedup | abs_err=9.77e-04, rel_err=8.88e-01
+  Workload 741eb2c4...: PASSED | 0.016 ms | 82.89x speedup | abs_err=2.67e-05, rel_err=1.11e-01
+  Workload 562d6431...: PASSED | 0.016 ms | 83.48x speedup | abs_err=1.95e-03, rel_err=2.88e-02
+  Workload cf76ded3...: PASSED | 0.016 ms | 81.20x speedup | abs_err=1.53e-05, rel_err=2.22e-02
+  Workload 55b3b0a4...: PASSED | 0.016 ms | 81.32x speedup | abs_err=2.44e-04, rel_err=2.83e-01
+  Workload 8add0e58...: PASSED | 0.016 ms | 82.44x speedup | abs_err=6.10e-05, rel_err=7.31e+00
+  Workload 5727c2b1...: PASSED | 0.016 ms | 79.83x speedup | abs_err=1.72e-05, rel_err=4.11e-02
+  Workload cc8d77b2...: PASSED | 0.016 ms | 81.47x speedup | abs_err=1.56e-02, rel_err=7.36e-02
+  Workload 3bd97bb8...: PASSED | 0.016 ms | 80.79x speedup | abs_err=2.29e-05, rel_err=2.33e-01
+  Workload f1b6043f...: PASSED | 0.016 ms | 82.21x speedup | abs_err=6.10e-05, rel_err=2.20e-01
+  Workload 8038c14e...: PASSED | 0.016 ms | 80.74x speedup | abs_err=7.81e-03, rel_err=2.09e-01
+  Workload 03436065...: PASSED | 0.016 ms | 80.60x speedup | abs_err=6.10e-05, rel_err=8.58e-02
+  Workload c40fb468...: PASSED | 0.016 ms | 81.37x speedup | abs_err=3.91e-03, rel_err=5.58e-02
+```
+
 ## Kernel 2
+
 - Remove HMEM<>SMEM load for state
 - SMEM for V and K
 - float4 loads
@@ -92,6 +118,7 @@ gdn_decode_qk4_v8_d128_k_last:
 ```
 
 ## Kernel 3
+
 Complete rewrite based on 46-experiment optimization campaign (30 CuTeDSL + 16 CUDA).
 
 Architecture: BV=8, 1 warp (32 threads) per block, 128 CTAs for B=1. Direct TVM FFI C binding via `TVM_FFI_DLL_EXPORT_TYPED_FUNC` (zero Python dispatch overhead).
@@ -111,7 +138,7 @@ Key optimizations:
 Key insights from campaign:
 - **TVM FFI C binding** (`TVM_FFI_DLL_EXPORT_TYPED_FUNC`) is the #1 speedup — eliminates ALL Python dispatch
 - **L2 persistence HURTS on B200** — the 126MB L2 naturally caches the 524KB state
-- **Shared memory staging HURTS** for this latency-bound kernel (confirmed by competition leader Tomas Ruiz)
+- **Shared memory staging HURTS** for this latency-bound kernel
 - Kernel is **instruction-latency-limited** at ~25% occupancy, NOT bandwidth-limited (<2% HBM BW at B=1)
 
 <details>

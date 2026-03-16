@@ -24,8 +24,7 @@ v3 is ~13% faster than v2 and significantly more consistent.
 Triton v2 baseline: 13.73x (88.7 µs) — CUDA v3 is **6.8x faster than Triton** on wall-clock.
 Modal has ~20% run-to-run variance due to different B200 instances.
 
-## Kernel 1 (Romit)
-
+## Kernel 1
 - Across number of tokens (B*T)
 - T == 1
 - Each block:
@@ -62,8 +61,7 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload c40fb468...: PASSED | 0.017 ms | 65.94x speedup | abs_err=1.95e-03, rel_err=7.97e-02
 ```
 
-## Kernel 2 (Romit)
-
+## Kernel 2
 - Remove HMEM<>SMEM load for state
 - SMEM for V and K
 - float4 loads
@@ -93,8 +91,7 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload c40fb468...: PASSED | 9.164 µs | 82.53x speedup | abs_err=1.95e-03, rel_err=3.15e-01
 ```
 
-## Kernel 3 (Pushkar)
-
+## Kernel 3
 Complete rewrite based on 46-experiment optimization campaign (30 CuTeDSL + 16 CUDA).
 
 Architecture: BV=8, 1 warp (32 threads) per block, 128 CTAs for B=1. Direct TVM FFI C binding via `TVM_FFI_DLL_EXPORT_TYPED_FUNC` (zero Python dispatch overhead).

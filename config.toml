@@ -5,5 +5,4 @@ author = "kachua"
 
 [build]
 language = "cuda"
-binding = "torch"
 entry_point = "kernel.cu::kernel_cuda"

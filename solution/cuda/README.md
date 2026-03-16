@@ -18,10 +18,8 @@ and write:
 |--------|---------------|----------------|-----------------|-------|
 | v1     | 75x           | 15 µs          | 75x, 82x       | 66-88x |
 | v2     | 82x           | 10 µs          | 78x, 84x       | 72-94x |
-| **v3** | **93x**       | **12 µs**      | **91x, 97x, 94x** | **86-110x** |
+| v3     | 93x           | 12 µs          | 91x, 97x, 94x  | 86-110x |
 
-v3 is ~13% faster than v2 and significantly more consistent.
-Triton v2 baseline: 13.73x (88.7 µs) — CUDA v3 is **6.8x faster than Triton** on wall-clock.
 Modal has ~20% run-to-run variance due to different B200 instances.
 
 ## Kernel 1
@@ -60,6 +58,8 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 8038c14e...: PASSED | 0.015 ms | 76.24x speedup | abs_err=3.05e-05, rel_err=7.28e-02
   Workload 03436065...: PASSED | 0.015 ms | 72.92x speedup | abs_err=3.91e-03, rel_err=2.43e-01
   Workload c40fb468...: PASSED | 0.017 ms | 65.94x speedup | abs_err=1.95e-03, rel_err=7.97e-02
+Stopping app - local entrypoint completed.
+✓ App completed. View run at https://modal.com/apps/mlsys-flashinfer-26/main/ap-BBj55dpwTlJzEmbvfte07B
 ```
 
 ```bash
@@ -84,6 +84,8 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 8038c14e...: PASSED | 0.016 ms | 80.74x speedup | abs_err=7.81e-03, rel_err=2.09e-01
   Workload 03436065...: PASSED | 0.016 ms | 80.60x speedup | abs_err=6.10e-05, rel_err=8.58e-02
   Workload c40fb468...: PASSED | 0.016 ms | 81.37x speedup | abs_err=3.91e-03, rel_err=5.58e-02
+Stopping app - local entrypoint completed.
+✓ App completed. View run at https://modal.com/apps/mlsys-flashinfer-26/main/ap-8jSGaiCjdorEMJIwwobEXS
 ```
 
 ## Kernel 2
@@ -92,6 +94,30 @@ gdn_decode_qk4_v8_d128_k_last:
 - SMEM for V and K
 - float4 loads
 - Remove the slowdowns I introduced in v1 (OLD__V and NEW_V in SMEM, beta and gate values stored in SMEM instead of registers)
+
+```bash
+gdn_decode_qk4_v8_d128_k_last:
+  Workload 6700a748...: PASSED | 10.238 µs | 72.69x speedup | abs_err=1.53e-05, rel_err=3.19e-02
+  Workload d66ae544...: PASSED | 10.052 µs | 78.93x speedup | abs_err=1.72e-05, rel_err=1.90e-01
+  Workload bf115ff9...: PASSED | 10.089 µs | 78.55x speedup | abs_err=6.25e-02, rel_err=1.39e-01
+  Workload 30bb1856...: PASSED | 10.067 µs | 78.54x speedup | abs_err=1.53e-05, rel_err=3.01e-02
+  Workload 48a5be68...: PASSED | 8.425 µs | 93.90x speedup | abs_err=3.91e-03, rel_err=1.66e-01
+  Workload 6f09252c...: PASSED | 9.992 µs | 78.85x speedup | abs_err=1.72e-05, rel_err=1.25e-01
+  Workload 1e4e5a87...: PASSED | 8.681 µs | 90.42x speedup | abs_err=1.72e-05, rel_err=2.54e-02
+  Workload 8e3e1aa6...: PASSED | 10.097 µs | 78.43x speedup | abs_err=4.88e-04, rel_err=9.78e-02
+  Workload 741eb2c4...: PASSED | 10.114 µs | 78.39x speedup | abs_err=2.29e-05, rel_err=9.06e-02
+  Workload 562d6431...: PASSED | 10.148 µs | 77.99x speedup | abs_err=1.95e-03, rel_err=1.22e-01
+  Workload cf76ded3...: PASSED | 10.016 µs | 78.94x speedup | abs_err=1.95e-03, rel_err=8.76e-03
+  Workload 55b3b0a4...: PASSED | 10.268 µs | 77.21x speedup | abs_err=7.81e-03, rel_err=7.12e-02
+  Workload 8add0e58...: PASSED | 10.204 µs | 77.08x speedup | abs_err=1.53e-05, rel_err=5.60e-02
+  Workload 5727c2b1...: PASSED | 10.033 µs | 78.26x speedup | abs_err=3.05e-05, rel_err=3.11e-02
+  Workload cc8d77b2...: PASSED | 10.027 µs | 78.70x speedup | abs_err=2.44e-04, rel_err=3.89e-02
+  Workload 3bd97bb8...: PASSED | 10.144 µs | 77.49x speedup | abs_err=2.44e-04, rel_err=2.64e-02
+  Workload f1b6043f...: PASSED | 10.109 µs | 77.74x speedup | abs_err=1.62e-05, rel_err=5.53e-02
+  Workload 8038c14e...: PASSED | 9.965 µs | 78.85x speedup | abs_err=1.53e-05, rel_err=2.37e-02
+  Workload 03436065...: PASSED | 9.919 µs | 79.40x speedup | abs_err=2.44e-04, rel_err=2.91e-01
+  Workload c40fb468...: PASSED | 10.041 µs | 78.57x speedup | abs_err=1.22e-04, rel_err=3.11e-02
+```
 
 ```bash
 gdn_decode_qk4_v8_d128_k_last:
@@ -115,6 +141,8 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 8038c14e...: PASSED | 9.168 µs | 82.74x speedup | abs_err=1.95e-03, rel_err=3.70e-02
   Workload 03436065...: PASSED | 9.147 µs | 86.89x speedup | abs_err=1.72e-05, rel_err=8.03e-02
   Workload c40fb468...: PASSED | 9.164 µs | 82.53x speedup | abs_err=1.95e-03, rel_err=3.15e-01
+Stopping app - local entrypoint completed.
+✓ App completed. View run at https://modal.com/apps/mlsys-flashinfer-26/main/ap-wTKDa8tqQRbrTvSQSGeB28
 ```
 
 ## Kernel 3

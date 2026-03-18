@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REMOTE_WORKSPACE = Path("/workspace")
+LOCAL_PROFILE_ROOT = PROJECT_ROOT / "profiles"
+PROFILE_VOLUME_NAME = "kachua-gdn-profiles"
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,21 @@ scale = 1.0 / (K_DIM ** 0.5)
 
     if target.backend == "cuda":
         body = """
+import torch.utils.cpp_extension as cpp_extension
+
+_original_load = cpp_extension.load
+
+
+def profile_load(*args, **kwargs):
+    extra_cuda_cflags = list(kwargs.get("extra_cuda_cflags") or [])
+    if "-lineinfo" not in extra_cuda_cflags:
+        extra_cuda_cflags.append("-lineinfo")
+    kwargs["extra_cuda_cflags"] = extra_cuda_cflags
+    return _original_load(*args, **kwargs)
+
+
+cpp_extension.load = profile_load
+
 binding = load_module("cuda_binding", str(Path(WORKSPACE) / "solution/cuda/binding.py"))
 run_kernel = getattr(binding, ENTRY_FUNCTION)
 
@@ -205,6 +223,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def to_volume_path(remote_path: str) -> str:
+    """Translate a container mount path into a Modal volume path."""
+    path = Path(remote_path)
+    if path.is_absolute() and path.parts[:2] == ("/", "profiles"):
+        return "/" + str(Path(*path.parts[2:]))
+    return remote_path
+
+
 try:
     import modal
 except ModuleNotFoundError:
@@ -213,7 +239,7 @@ except ModuleNotFoundError:
 
 if modal is not None:
     app = modal.App("kachua-gdn-profile")
-    profile_volume = modal.Volume.from_name("kachua-gdn-profiles", create_if_missing=True)
+    profile_volume = modal.Volume.from_name(PROFILE_VOLUME_NAME, create_if_missing=True)
     profile_dir = Path("/profiles")
     image = (
         modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
@@ -249,11 +275,110 @@ if modal is not None:
         ncu_set: str,
         warmup: int,
     ) -> dict[str, str | int]:
+        import csv
         import glob
+        import io
+        import math
         import subprocess
         from uuid import uuid4
 
         target = json.loads(target_json)
+
+        def parse_number(value: str) -> float | None:
+            head = value.split(";", maxsplit=1)[0].strip()
+            if not head or head.lower() == "n/a":
+                return None
+            try:
+                return float(head)
+            except ValueError:
+                return None
+
+        def parse_raw_metrics(raw_csv: str) -> dict[str, dict[str, str]]:
+            metrics: dict[str, dict[str, str]] = {}
+            reader = csv.reader(io.StringIO(raw_csv))
+            rows = list(reader)
+            if len(rows) < 3:
+                return metrics
+
+            names = rows[0]
+            units = rows[1]
+            values = rows[2]
+            width = min(len(names), len(units), len(values))
+
+            for index in range(width):
+                name = names[index].strip()
+                unit = units[index].strip()
+                value = values[index].strip()
+                if not name or not value:
+                    continue
+                metrics[name] = {"unit": unit, "value": value}
+            return metrics
+
+        def pick_metric(
+            metrics: dict[str, dict[str, str]], names: tuple[str, ...]
+        ) -> dict[str, str] | None:
+            for name in names:
+                if name in metrics:
+                    return {"name": name, **metrics[name]}
+            return None
+
+        def summarize_metrics(metrics: dict[str, dict[str, str]]) -> dict[str, object]:
+            summary: dict[str, object] = {
+                "kernel_name": metrics.get("Kernel Name", {}).get("value"),
+                "launch__grid_size": pick_metric(metrics, ("launch__grid_size",)),
+                "launch__block_size": pick_metric(metrics, ("launch__block_size",)),
+                "launch__registers_per_thread": pick_metric(
+                    metrics, ("launch__registers_per_thread",)
+                ),
+                "gpu__time_duration.sum": pick_metric(
+                    metrics, ("gpu__time_duration.sum",)
+                ),
+                "sm__throughput": pick_metric(
+                    metrics,
+                    (
+                        "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+                        "sm__throughput.avg.pct_of_peak_sustained_active",
+                    ),
+                ),
+                "dram__throughput": pick_metric(
+                    metrics,
+                    (
+                        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+                        "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+                    ),
+                ),
+                "l2_hit_rate": pick_metric(
+                    metrics,
+                    (
+                        "lts__t_sector_hit_rate.pct",
+                        "lts__t_sectors_srcunit_tex_op_read_lookup_hit_rate.pct",
+                    ),
+                ),
+                "achieved_occupancy": pick_metric(
+                    metrics, ("sm__warps_active.avg.pct_of_peak_sustained_active",)
+                ),
+            }
+
+            stall_metrics: list[dict[str, object]] = []
+            for name, metric in metrics.items():
+                lower = name.lower()
+                if "stalled" not in lower and "stall" not in lower:
+                    continue
+                numeric = parse_number(metric["value"])
+                if numeric is None or math.isnan(numeric):
+                    continue
+                stall_metrics.append(
+                    {
+                        "name": name,
+                        "unit": metric["unit"],
+                        "value": metric["value"],
+                        "numeric_value": numeric,
+                    }
+                )
+
+            stall_metrics.sort(key=lambda item: float(item["numeric_value"]), reverse=True)
+            summary["top_stall_metrics"] = stall_metrics[:10]
+            return summary
 
         for relative_path, content in source_files.items():
             out_path = REMOTE_WORKSPACE / relative_path
@@ -293,14 +418,75 @@ if modal is not None:
             timeout=900,
             cwd=str(REMOTE_WORKSPACE),
         )
+
+        report_path = report_stem.with_suffix(".ncu-rep")
+        raw_csv_path = report_stem.with_suffix(".raw.csv")
+        details_path = report_stem.with_suffix(".details.txt")
+        summary_path = report_stem.with_suffix(".summary.json")
+
+        raw_csv_stdout = ""
+        details_stdout = ""
+        summary_json = ""
+        extraction_stderr = ""
+
+        if result.returncode == 0:
+            raw_command = [
+                ncu,
+                "--import",
+                str(report_path),
+                "--page",
+                "raw",
+                "--csv",
+            ]
+            raw_result = subprocess.run(
+                raw_command,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=str(REMOTE_WORKSPACE),
+            )
+            raw_csv_stdout = raw_result.stdout
+            extraction_stderr += raw_result.stderr
+            raw_csv_path.write_text(raw_csv_stdout)
+
+            details_command = [
+                ncu,
+                "--import",
+                str(report_path),
+                "--page",
+                "details",
+            ]
+            details_result = subprocess.run(
+                details_command,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=str(REMOTE_WORKSPACE),
+            )
+            details_stdout = details_result.stdout
+            extraction_stderr += details_result.stderr
+            details_path.write_text(details_stdout)
+
+            metrics = parse_raw_metrics(raw_csv_stdout)
+            summary = summarize_metrics(metrics)
+            summary_json = json.dumps(summary, indent=2, sort_keys=True)
+            summary_path.write_text(summary_json)
+
         profile_volume.commit()
         return {
             "backend": target["backend"],
             "entry_file": target["entry_file"],
             "exit_code": result.returncode,
-            "report_path": str(report_stem.with_suffix(".ncu-rep")),
+            "report_path": str(report_path),
+            "raw_csv_path": str(raw_csv_path),
+            "details_path": str(details_path),
+            "summary_path": str(summary_path),
             "stdout": result.stdout,
             "stderr": result.stderr,
+            "raw_csv_excerpt": "\n".join(raw_csv_stdout.splitlines()[:40]),
+            "details_excerpt": "\n".join(details_stdout.splitlines()[:60]),
+            "summary_json": summary_json,
+            "extraction_stderr": extraction_stderr,
         }
 
     @app.local_entrypoint()
@@ -325,11 +511,91 @@ if modal is not None:
             warmup=warmup,
         )
 
+        local_target_dir = LOCAL_PROFILE_ROOT / target.backend / Path(target.entry_file).stem
+        local_target_dir.mkdir(parents=True, exist_ok=True)
+
+        remote_paths = [
+            result["report_path"],
+            result.get("raw_csv_path"),
+            result.get("details_path"),
+            result.get("summary_path"),
+        ]
+        downloaded_paths: list[Path] = []
+        download_failed = False
+
+        for remote_path in remote_paths:
+            if not remote_path:
+                continue
+            volume_path = to_volume_path(str(remote_path))
+            local_path = local_target_dir / Path(str(remote_path)).name
+            download = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "modal",
+                    "volume",
+                    "get",
+                    "--force",
+                    PROFILE_VOLUME_NAME,
+                    volume_path,
+                    str(local_path),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(PROJECT_ROOT),
+            )
+            if download.returncode != 0:
+                download_failed = True
+                print(f"FAILED to download {remote_path} to {local_path}")
+                if download.stdout:
+                    print(download.stdout)
+                if download.stderr:
+                    print(download.stderr)
+                continue
+            downloaded_paths.append(local_path)
+
+        if not download_failed:
+            for remote_path in remote_paths:
+                if not remote_path:
+                    continue
+                volume_path = to_volume_path(str(remote_path))
+                cleanup = subprocess.run(
+                    [
+                        "uv",
+                        "run",
+                        "modal",
+                        "volume",
+                        "rm",
+                        PROFILE_VOLUME_NAME,
+                        volume_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(PROJECT_ROOT),
+                )
+                if cleanup.returncode != 0 and cleanup.stderr:
+                    print(cleanup.stderr)
+
         print(f"Profiled {target.backend} from config entry {target.entry_file}::{target.entry_function}")
         print(f"ncu exit code: {result['exit_code']}")
-        print(f"report saved to Modal Volume at {result['report_path']}")
+        for local_path in downloaded_paths:
+            print(f"downloaded profile artifact to {local_path}")
+        if download_failed:
+            print(f"report remains on Modal Volume at {result['report_path']}")
         if result["stdout"]:
             print(result["stdout"])
+        if result.get("summary_json"):
+            print("SUMMARY JSON:")
+            print(result["summary_json"])
+        if result.get("raw_csv_excerpt"):
+            print("RAW CSV EXCERPT:")
+            print(result["raw_csv_excerpt"])
+        if result.get("details_excerpt"):
+            print("DETAILS EXCERPT:")
+            print(result["details_excerpt"])
+        if result.get("extraction_stderr"):
+            print("EXTRACTION STDERR:")
+            print(result["extraction_stderr"])
         if result["stderr"]:
             print("STDERR:")
             print(result["stderr"])

@@ -80,6 +80,8 @@ def build_runner_source(target: ProfileTarget, batch_size: int, warmup: int, see
     """Build the Python runner executed under Nsight Compute inside Modal."""
     base = """
 import importlib.util
+import ctypes
+import os
 import sys
 import types
 from pathlib import Path
@@ -96,9 +98,29 @@ def load_module(module_name: str, module_path: str):
     return module
 
 
+def prepend_env_path(name: str, value: str):
+    current = os.environ.get(name)
+    os.environ[name] = f"{value}:{current}" if current else value
+
+
+spec = importlib.util.find_spec("tvm_ffi")
+if spec is None or not spec.submodule_search_locations:
+    raise RuntimeError("apache-tvm-ffi must be installed in the profiling image")
+
+tvm_ffi_root = Path(next(iter(spec.submodule_search_locations))).resolve()
+for include_dir in (
+    tvm_ffi_root / "include",
+    tvm_ffi_root / "3rdparty/dlpack/include",
+):
+    prepend_env_path("CPATH", str(include_dir))
+    prepend_env_path("CPLUS_INCLUDE_PATH", str(include_dir))
+
+ctypes.CDLL(str(tvm_ffi_root / "core.abi3.so"), mode=ctypes.RTLD_GLOBAL)
+
+
 stub_tvm_ffi = types.ModuleType("tvm_ffi")
 stub_tvm_ffi.register_global_func = lambda _name: (lambda function: function)
-sys.modules.setdefault("tvm_ffi", stub_tvm_ffi)
+sys.modules["tvm_ffi"] = stub_tvm_ffi
 
 
 torch.manual_seed(SEED)
@@ -195,12 +217,18 @@ if modal is not None:
     profile_dir = Path("/profiles")
     image = (
         modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
-        .uv_pip_install("flashinfer-bench", "flashinfer-python", "torch", "triton")
+        .uv_pip_install(
+            "apache-tvm-ffi",
+            "flashinfer-bench",
+            "flashinfer-python",
+            "torch",
+            "triton",
+        )
         .apt_install("wget", "gnupg", "build-essential", "ninja-build")
         .run_commands(
             "wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/"
             "ubuntu2204/x86_64/3bf863cc.pub | "
-            "gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg",
+            "gpg --batch --yes --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg",
             "echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] "
             "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /' "
             "> /etc/apt/sources.list.d/cuda.list",

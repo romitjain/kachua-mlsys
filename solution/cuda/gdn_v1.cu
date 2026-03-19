@@ -128,7 +128,7 @@ __global__ void gdn_v1(
     }
 }
 
-extern "C" cudaError_t launch_gdn_v1(
+extern "C" cudaError_t launch_gdn(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
@@ -230,7 +230,7 @@ int main() {
     }
     for (size_t i = 0; i < out_elems; ++i) out[i] = __float2bfloat16_rn(0.0f);
 
-    const cudaError_t launch_err = launch_gdn_v1(
+    const cudaError_t launch_err = launch_gdn(
         q,
         k,
         v,
@@ -250,7 +250,7 @@ int main() {
         nullptr
     );
     if (launch_err != cudaSuccess) {
-        std::printf("launch_gdn_v1 failed: %s\n", cudaGetErrorString(launch_err));
+        std::printf("launch_gdn failed: %s\n", cudaGetErrorString(launch_err));
         return 1;
     }
     cudaDeviceSynchronize();
@@ -273,7 +273,7 @@ int main() {
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-void launch_gdn_v1_torch(
+void launch_gdn_torch(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -293,7 +293,7 @@ void launch_gdn_v1_torch(
     const int V = static_cast<int>(v.size(3));
 
     const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
-    (void)launch_gdn_v1(
+    (void)launch_gdn(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
@@ -315,6 +315,6 @@ void launch_gdn_v1_torch(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_gdn_v1", &launch_gdn_v1_torch, "Launch gdn_v1 CUDA kernel");
+    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn_v1 CUDA kernel");
 }
 #endif  // TORCH_EXTENSION_NAME

@@ -130,7 +130,7 @@ __global__ void gdn_v1(
     }
 }
 
-__global__ void gdn_v2(
+__global__ void gdn_decode_kernel(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v,
@@ -252,7 +252,7 @@ extern "C" cudaError_t launch_gdn(
     dim3 threads_per_block(32, kSplitV);
     dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
 
-    gdn_v2<<<grid_size, threads_per_block, 0, stream>>>(
+    gdn_decode_kernel<<<grid_size, threads_per_block, 0, stream>>>(
         q,
         k,
         v,

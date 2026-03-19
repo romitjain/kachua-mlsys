@@ -30,7 +30,7 @@ __device__ __forceinline__ float sigmoid(float x) {
     }
 }
 
-__global__ void gdn_v1(
+__global__ void gdn_decode_kernel(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v,
@@ -153,7 +153,7 @@ extern "C" cudaError_t launch_gdn(
     dim3 threads_per_block(32, split_v);
     dim3 grid_size(B, num_v_heads, (V+split_v-1)/split_v);
 
-    gdn_v1<<<grid_size, threads_per_block, 0, stream>>>(
+    gdn_decode_kernel<<<grid_size, threads_per_block, 0, stream>>>(
         q,
         k,
         v,
@@ -315,6 +315,6 @@ void launch_gdn_torch(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn_v1 CUDA kernel");
+    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn_decode_kernel CUDA kernel");
 }
 #endif  // TORCH_EXTENSION_NAME

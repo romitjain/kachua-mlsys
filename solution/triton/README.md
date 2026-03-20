@@ -12,15 +12,14 @@ and write:
 1. Updated state (VxK)
 2. Output (1xV)
 
-## Benchmark Summary (3 runs each, Modal B200)
+## Benchmark Summary (Modal B200)
 
-| Kernel | Median Speedup | Median Latency | Per-run Medians | Range |
-|--------|---------------|----------------|-----------------|-------|
-| v1     | 11.73x        | 104.4 µs       | 12.2x, 14.5x, 11.6x | 10.3-15.1x |
-| v2     | 13.73x        | 88.7 µs        | 13.7x, 14.2x, 13.3x | 12.5-14.9x |
+| Kernel | Benchmark Latency | Kernel Latency (NCU) | Speedup | Regs/Thread |
+|--------|-------------------|---------------------|---------|-------------|
+| v1     | ~104 µs           | —                   | ~12x    | —           |
+| v2     | ~88 µs            | 4.96 µs             | ~14x    | 32          |
+| v3     | ~55 µs            | 4.74 µs             | ~12x    | 30          |
 
-v2 is ~17% faster and significantly more consistent (tighter variance across runs).
-Modal has ~20% run-to-run variance due to different B200 instances.
 
 ## Kernel v1
 
@@ -203,5 +202,53 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 8038c14e...: PASSED | 87.625 µs | 13.35x speedup | abs_err=3.12e-02, rel_err=2.42e-02
   Workload 03436065...: PASSED | 89.750 µs | 12.90x speedup | abs_err=9.54e-05, rel_err=7.59e-02
   Workload c40fb468...: PASSED | 88.186 µs | 13.27x speedup | abs_err=1.72e-05, rel_err=1.99e-02
+```
+</details>
+
+## Kernel v3 (current)
+
+Evolved from v2 through 24 experiments on B200. Key changes:
+
+- **BV=8** (128 blocks) — 86% SM coverage on 148 SMs vs v2's 43% with BV=16
+- **Plain pointer arithmetic** — generates tighter PTX than `make_block_ptr` descriptors
+- **Live range optimization** — output computed via algebraic identity `output = scale * (old_state@q + delta_v * dot(k,q))` BEFORE materializing `state_out`. Decouples output from state store, improving IPC 25%
+- **Compact delta** — `delta_v = beta*(v - old_v)` eliminates intermediate `new_v`
+
+**NCU Profile (B=1):**
+
+| Metric | v2 | v3 |
+|--------|----|----|
+| Kernel time | 4.96 µs | 4.74 µs |
+| IPC Active | 0.54 | 0.72 |
+| SM Active Cycles | 1497 | 2425 |
+| Compute Throughput | 1.72% | 4.75% |
+| L1/TEX Throughput | 12.19% | 13.22% |
+| Elapsed Cycles | 9748 | 8796 |
+
+<details>
+<summary>Benchmark run (median ~12x, ~55 µs)</summary>
+
+```
+gdn_decode_qk4_v8_d128_k_last:
+  Workload 6700a748...: PASSED | 55.441 µs | 11.97x speedup | abs_err=3.43e-05, rel_err=1.35e-02
+  Workload d66ae544...: PASSED | 55.385 µs | 12.03x speedup | abs_err=2.29e-05, rel_err=1.14e+00
+  Workload bf115ff9...: PASSED | 55.517 µs | 11.98x speedup | abs_err=2.29e-05, rel_err=1.24e-02
+  Workload 30bb1856...: PASSED | 55.201 µs | 12.04x speedup | abs_err=6.10e-05, rel_err=2.22e-01
+  Workload 48a5be68...: PASSED | 54.707 µs | 12.22x speedup | abs_err=6.10e-05, rel_err=5.69e-02
+  Workload 6f09252c...: PASSED | 55.221 µs | 12.04x speedup | abs_err=3.05e-05, rel_err=1.10e-01
+  Workload 1e4e5a87...: PASSED | 55.215 µs | 12.15x speedup | abs_err=2.44e-04, rel_err=1.04e-01
+  Workload 8e3e1aa6...: PASSED | 55.114 µs | 12.12x speedup | abs_err=4.88e-04, rel_err=5.22e-02
+  Workload 741eb2c4...: PASSED | 55.120 µs | 12.13x speedup | abs_err=1.56e-02, rel_err=2.57e-01
+  Workload 562d6431...: PASSED | 55.623 µs | 11.97x speedup | abs_err=1.95e-03, rel_err=2.26e-01
+  Workload cf76ded3...: PASSED | 55.321 µs | 12.07x speedup | abs_err=6.10e-05, rel_err=2.06e-02
+  Workload 55b3b0a4...: PASSED | 55.099 µs | 12.19x speedup | abs_err=9.77e-04, rel_err=2.09e-01
+  Workload 8add0e58...: PASSED | 55.276 µs | 12.07x speedup | abs_err=1.56e-02, rel_err=1.52e-02
+  Workload 5727c2b1...: PASSED | 55.573 µs | 11.99x speedup | abs_err=1.56e-02, rel_err=3.48e-02
+  Workload cc8d77b2...: PASSED | 55.520 µs | 12.04x speedup | abs_err=4.88e-04, rel_err=5.70e-02
+  Workload 3bd97bb8...: PASSED | 55.706 µs | 11.98x speedup | abs_err=1.22e-04, rel_err=1.07e-02
+  Workload f1b6043f...: PASSED | 55.153 µs | 12.08x speedup | abs_err=2.48e-05, rel_err=3.33e-01
+  Workload 8038c14e...: PASSED | 55.272 µs | 12.11x speedup | abs_err=1.95e-03, rel_err=1.87e-01
+  Workload 03436065...: PASSED | 55.715 µs | 12.03x speedup | abs_err=4.88e-04, rel_err=2.97e-01
+  Workload c40fb468...: PASSED | 55.267 µs | 12.15x speedup | abs_err=1.56e-02, rel_err=1.92e-01
 ```
 </details>

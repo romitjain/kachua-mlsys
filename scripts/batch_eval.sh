@@ -55,12 +55,17 @@ run_kernel() {
     echo "  [$kernel_id] Benchmark + Profile"
     echo "============================================"
 
-    echo "--- [$kernel_id] benchmark ---"
-    uv run modal run scripts/run_modal.py 2>&1 | tee "$BENCH_DIR/${kernel_id}.txt" || true
+    uv run modal run scripts/run_modal.py 2>&1 | tee "$BENCH_DIR/${kernel_id}.txt" &
+    local bench_pid=$!
 
     if [[ "$PROFILE" == true ]]; then
-        echo "--- [$kernel_id] profile ---"
-        uv run modal run scripts/profile_modal.py 2>&1 | tee "$BENCH_DIR/${kernel_id}_profile.txt" || true
+        uv run modal run scripts/profile_modal.py 2>&1 | tee "$BENCH_DIR/${kernel_id}_profile.txt" &
+        local profile_pid=$!
+    fi
+
+    wait "$bench_pid" || true
+    if [[ "$PROFILE" == true ]]; then
+        wait "$profile_pid" || true
     fi
 }
 
@@ -103,7 +108,13 @@ echo "  Batch evaluation complete"
 echo "============================================"
 echo ""
 echo "Benchmarks:"
-ls -1 "$BENCH_DIR/" 2>/dev/null || echo "  (none)"
+for f in "$BENCH_DIR"/*.txt; do
+    [[ -f "$f" ]] && [[ "$f" != *_profile.txt ]] && echo "  $(basename "$f")"
+done
 echo ""
-echo "Profiles:"
-find profiles -name "profile.summary.json" -newer "$BENCH_DIR" 2>/dev/null | sort || echo "  (none)"
+if [[ "$PROFILE" == true ]]; then
+    echo "Profiles:"
+    for f in "$BENCH_DIR"/*_profile.txt; do
+        [[ -f "$f" ]] && echo "  $(basename "$f")"
+    done
+fi

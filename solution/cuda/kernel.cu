@@ -14,22 +14,19 @@
  *   7. __expf/__logf/__frcp_rn fast math intrinsics for gate/sigmoid
  *   8. All problem dimensions hardcoded as constexpr (compiler constant-folding)
  *   9. __launch_bounds__(32, 1) for maximum register budget per thread
- *  10. Direct TVM FFI C binding via TVM_FFI_DLL_EXPORT_TYPED_FUNC (zero Python dispatch)
  *
  * Grid:  (V_DIM/BV=16, B*HV=8) = 128 CTAs for B=1.
  * Block: 32 threads (1 warp). Each thread owns KVEC=4 K-elements across BV=8 V-rows.
  *
  * Benchmark results (Modal B200, flashinfer-bench):
- *   Median: 90-106x speedup (B200 instance-dependent, ~20% variance)
- *   Peak:   117x speedup
- *   Latency: 11.4-14.0 µs wall-clock (GPU kernel ~2-3 µs + TVM FFI dispatch ~10 µs)
+ *   Median: 75-80x speedup (B200 instance-dependent, ~20% variance)
+ *   Latency: ~15-17 µs wall-clock (GPU kernel ~5 µs + torch binding dispatch)
  */
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/extra/c_env_api.h>
-#include <tvm/ffi/function.h>
+#include <torch/extension.h>
 
 // ---- Constants ----
 
@@ -199,50 +196,9 @@ void gdn_decode_kernel(
     }
 }
 
-// ---- TVM FFI C Binding (zero Python dispatch overhead) ----
+// ---- Torch pybind11 binding ----
 
-void KernelCuda(
-    tvm::ffi::TensorView q,
-    tvm::ffi::TensorView k,
-    tvm::ffi::TensorView v,
-    tvm::ffi::TensorView state,
-    tvm::ffi::TensorView A_log,
-    tvm::ffi::TensorView a,
-    tvm::ffi::TensorView dt_bias,
-    tvm::ffi::TensorView b_gate,
-    double scale,
-    tvm::ffi::TensorView output,
-    tvm::ffi::TensorView new_state)
-{
-    const int B = q.size(0);
-
-    DLDevice dev = q.device();
-    cudaStream_t stream = static_cast<cudaStream_t>(
-        TVMFFIEnvGetStream(dev.device_type, dev.device_id));
-
-    constexpr int BV = 8;
-    gdn_decode_kernel<BV><<<dim3(V_DIM / BV, B * HV), dim3(WARP_SIZE), 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data_ptr()),
-        static_cast<const __nv_bfloat16*>(k.data_ptr()),
-        static_cast<const __nv_bfloat16*>(v.data_ptr()),
-        static_cast<const float*>(state.data_ptr()),
-        static_cast<const float*>(A_log.data_ptr()),
-        static_cast<const __nv_bfloat16*>(a.data_ptr()),
-        static_cast<const float*>(dt_bias.data_ptr()),
-        static_cast<const __nv_bfloat16*>(b_gate.data_ptr()),
-        static_cast<__nv_bfloat16*>(output.data_ptr()),
-        static_cast<float*>(new_state.data_ptr()));
-}
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel_cuda, KernelCuda);
-
-// ---- Torch pybind11 fallback (local testing only) ----
-
-#ifdef TORCH_EXTENSION_NAME
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
-
-void launch_gdn_torch(
+void launch_gdn(
     torch::Tensor q, torch::Tensor k, torch::Tensor v,
     torch::Tensor state, torch::Tensor A_log, torch::Tensor a,
     torch::Tensor dt_bias, torch::Tensor b, float scale,
@@ -265,6 +221,5 @@ void launch_gdn_torch(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_gdn", &launch_gdn_torch, "GDN decode v3");
+    m.def("launch_gdn", &launch_gdn, "GDN decode v3");
 }
-#endif

@@ -224,5 +224,6 @@ __marimo__/
 .worktrees/
 mlsys26-contest/
 profiles/
+results/
 AGENTS.md
 CLAUDE.md

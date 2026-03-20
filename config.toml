@@ -5,4 +5,5 @@ author = "kachua"
 
 [build]
 language = "cuda"
-entry_point = "kernel.cu::kernel_cuda"
+binding = "torch"
+entry_point = "kernel.cu::launch_gdn"

@@ -23,7 +23,7 @@ GVA_RATIO: int = NUM_V_HEADS // NUM_Q_HEADS
 
 
 @register_func("flashinfer.kernel")
-def launch_gdn_v2(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
+def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     """Launch the Triton v2 decode kernel.
 
     The framework calls this as kernel(*inputs, *outputs), passing

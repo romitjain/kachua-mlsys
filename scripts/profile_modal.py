@@ -29,6 +29,7 @@ class ProfileTarget:
     entry_function: str
     ncu_kernel_regex: str
     source_files: tuple[str, ...]
+    binding: str | None = None
 
 
 def load_config() -> dict:
@@ -44,19 +45,16 @@ def resolve_profile_target() -> ProfileTarget:
     language = build["language"]
 
     if language == "cuda":
-        stem = Path(entry_file).stem
-        if stem == "gdn_v1":
-            kernel_regex = "regex:.*gdn_v1.*"
-        elif stem == "gdn_v2":
-            kernel_regex = "regex:.*gdn_v2.*"
-        else:
-            kernel_regex = "regex:.*gdn_decode_kernel.*"
+        kernel_regex = "regex:.*gdn_decode_kernel.*"
+        binding = build.get("binding")
+        source_files = [f"solution/cuda/{entry_file}", "solution/cuda/binding.py"]
         return ProfileTarget(
             backend="cuda",
             entry_file=entry_file,
             entry_function="kernel",
             ncu_kernel_regex=kernel_regex,
-            source_files=("solution/cuda/binding.py", f"solution/cuda/{entry_file}"),
+            source_files=tuple(source_files),
+            binding=binding,
         )
 
     if language == "triton":
@@ -66,6 +64,15 @@ def resolve_profile_target() -> ProfileTarget:
             entry_function=entry_function,
             ncu_kernel_regex="regex:.*gdn_decode_kernel.*",
             source_files=(f"solution/triton/{entry_file}",),
+        )
+
+    if language == "cute":
+        return ProfileTarget(
+            backend="cute",
+            entry_file=entry_file,
+            entry_function=entry_function,
+            ncu_kernel_regex="regex:.*gdn_decode_kernel.*",
+            source_files=(f"solution/cute/{entry_file}",),
         )
 
     raise ValueError(f"Unsupported language in config.toml: {language}")
@@ -146,7 +153,7 @@ b = torch.randn(B, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
 scale = 1.0 / (K_DIM ** 0.5)
 """
 
-    if target.backend == "cuda":
+    if target.backend == "cuda" and target.binding == "torch":
         body = """
 import torch.utils.cpp_extension as cpp_extension
 
@@ -176,11 +183,58 @@ torch.cuda.synchronize()
 run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
 torch.cuda.synchronize()
 """
-    else:
+    elif target.backend == "cuda":
         body = """
+import subprocess as _sp
+
+# Undo the tvm_ffi stub — need real tvm_ffi for C++ function registration
+del sys.modules["tvm_ffi"]
+import tvm_ffi
+
+# Compile kernel.cu into a shared object with TVM FFI headers
+kernel_src = str(Path(WORKSPACE) / "solution/cuda" / ENTRY_FILE)
+so_path = "/tmp/gdn_kernel.so"
+nvcc_cmd = [
+    "nvcc", kernel_src,
+    "-shared", "-o", so_path,
+    "-Xcompiler", "-fPIC",
+    "-I" + str(tvm_ffi_root / "include"),
+    "-I" + str(tvm_ffi_root / "3rdparty" / "dlpack" / "include"),
+    "-std=c++17", "-O3", "-lineinfo",
+    "-arch=native",
+]
+nvcc_result = _sp.run(nvcc_cmd, capture_output=True, text=True)
+if nvcc_result.returncode != 0:
+    print("NVCC STDOUT:", nvcc_result.stdout)
+    print("NVCC STDERR:", nvcc_result.stderr)
+    raise RuntimeError(f"nvcc failed with exit code {nvcc_result.returncode}")
+
+# Load .so via tvm_ffi (keeps handle alive, registers exported functions)
+_kernel_mod = tvm_ffi.load_module(so_path)
+kernel_func = _kernel_mod[ENTRY_FUNCTION]
+
+output = torch.empty(B, 1, NUM_V_HEADS, V_DIM, dtype=torch.bfloat16, device=device)
+new_state = torch.empty_like(state)
+
+def invoke():
+    kernel_func(q, k, v, state, A_log, a, dt_bias, b, float(scale), output, new_state)
+
+invoke()
+torch.cuda.synchronize()
+
+for _ in range(WARMUP):
+    invoke()
+torch.cuda.synchronize()
+
+invoke()
+torch.cuda.synchronize()
+"""
+    elif target.backend in ("triton", "cute"):
+        backend_dir = "triton" if target.backend == "triton" else "cute"
+        body = f"""
 kernel_module = load_module(
-    "triton_kernel",
-    str(Path(WORKSPACE) / "solution/triton" / ENTRY_FILE),
+    "{target.backend}_kernel",
+    str(Path(WORKSPACE) / "solution/{backend_dir}" / ENTRY_FILE),
 )
 run_kernel = getattr(kernel_module, ENTRY_FUNCTION)
 
@@ -198,6 +252,10 @@ torch.cuda.synchronize()
 
 invoke()
 torch.cuda.synchronize()
+"""
+    else:
+        body = f"""
+raise ValueError("Unsupported backend for profiling: {target.backend}")
 """
 
     prelude = textwrap.dedent(
@@ -274,13 +332,13 @@ if modal is not None:
         runner_source: str,
         ncu_set: str,
         warmup: int,
+        run_id: str,
     ) -> dict[str, str | int]:
         import csv
         import glob
         import io
         import math
         import subprocess
-        from uuid import uuid4
 
         target = json.loads(target_json)
 
@@ -388,9 +446,9 @@ if modal is not None:
         runner_path = REMOTE_WORKSPACE / "runner.py"
         runner_path.write_text(runner_source)
 
-        target_dir = profile_dir / target["backend"] / Path(target["entry_file"]).stem
+        target_dir = profile_dir / target["backend"] / Path(target["entry_file"]).stem / run_id
         target_dir.mkdir(parents=True, exist_ok=True)
-        report_stem = target_dir / uuid4().hex
+        report_stem = target_dir / "profile"
 
         ncu = sorted(glob.glob("/opt/nvidia/nsight-compute/*/ncu"))[-1]
         command = [
@@ -496,7 +554,11 @@ if modal is not None:
         seed: int = 7,
         ncu_set: str = "basic",
     ) -> None:
+        from datetime import datetime
+
         target = resolve_profile_target()
+        run_id = f"{datetime.now():%Y%m%d_%H%M%S}_b{batch_size}"
+
         result = run_profile.remote(
             target_json=json.dumps(
                 {
@@ -509,9 +571,11 @@ if modal is not None:
             runner_source=build_runner_source(target, batch_size=batch_size, warmup=warmup, seed=seed),
             ncu_set=ncu_set,
             warmup=warmup,
+            run_id=run_id,
         )
 
-        local_target_dir = LOCAL_PROFILE_ROOT / target.backend / Path(target.entry_file).stem
+        stem = Path(target.entry_file).stem
+        local_target_dir = LOCAL_PROFILE_ROOT / target.backend / stem / run_id
         local_target_dir.mkdir(parents=True, exist_ok=True)
 
         remote_paths = [

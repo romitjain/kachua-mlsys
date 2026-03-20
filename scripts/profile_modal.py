@@ -277,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1, help="Synthetic batch size")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup launches before profiling")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for synthetic inputs")
-    parser.add_argument("--ncu-set", default="basic", help="Nsight Compute metric set")
+    parser.add_argument("--ncu-set", default="full", help="Nsight Compute metric set")
     return parser.parse_args()
 
 

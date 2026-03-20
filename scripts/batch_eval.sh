@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Batch evaluation: benchmark all kernel versions on B200 via Modal.
-# Copies archived kernels into solution/ temporarily; restores via git checkout on exit.
+# Auto-discovers archived kernels from archive/{cuda,triton}/ and
+# benchmarks the current solution/ versions last.
 #
 # Usage: bash scripts/batch_eval.sh
 
@@ -55,27 +56,32 @@ run_kernel() {
 
 # ---------- main ----------
 
-# --- CUDA v1 ---
-cp archive/cuda/gdn_v1.cu solution/cuda/kernel.cu
-write_config "cuda" "kernel.cu::launch_gdn" "gdn-decode-cuda-v1" "torch"
-run_kernel "cuda_v1"
+# Archived CUDA kernels
+for f in archive/cuda/gdn_*.cu; do
+    [[ -f "$f" ]] || continue
+    stem=$(basename "$f" .cu)
+    label="cuda_${stem#gdn_}"
+    cp "$f" solution/cuda/kernel.cu
+    write_config "cuda" "kernel.cu::launch_gdn" "gdn-decode-${label}" "torch"
+    run_kernel "$label"
+done
 
-# --- CUDA v2 ---
-cp archive/cuda/gdn_v2.cu solution/cuda/kernel.cu
-write_config "cuda" "kernel.cu::launch_gdn" "gdn-decode-cuda-v2" "torch"
-run_kernel "cuda_v2"
-
-# --- CUDA v3 ---
+# Current CUDA kernel
 git checkout -- solution/cuda/kernel.cu
-write_config "cuda" "kernel.cu::launch_gdn" "gdn-decode-cuda-v3" "torch"
-run_kernel "cuda_v3"
+write_config "cuda" "kernel.cu::launch_gdn" "gdn-decode-cuda-current" "torch"
+run_kernel "cuda_current"
 
-# --- Triton v1 ---
-cp archive/triton/kernel_v1.py solution/triton/kernel.py
-write_config "triton" "kernel.py::launch_gdn" "gdn-decode-triton-v1"
-run_kernel "triton_v1"
+# Archived Triton kernels
+for f in archive/triton/kernel_*.py; do
+    [[ -f "$f" ]] || continue
+    stem=$(basename "$f" .py)
+    label="triton_${stem#kernel_}"
+    cp "$f" solution/triton/kernel.py
+    write_config "triton" "kernel.py::launch_gdn" "gdn-decode-${label}"
+    run_kernel "$label"
+done
 
-# --- Triton current ---
+# Current Triton kernel
 git checkout -- solution/triton/kernel.py
 write_config "triton" "kernel.py::launch_gdn" "gdn-decode-triton-current"
 run_kernel "triton_current"

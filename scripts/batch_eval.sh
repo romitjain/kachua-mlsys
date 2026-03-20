@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Batch evaluation: benchmark all kernel versions on B200 via Modal.
+# Batch evaluation: benchmark + profile all kernel versions on B200 via Modal.
 # Auto-discovers archived kernels from archive/{cuda,triton}/ and
-# benchmarks the current solution/ versions last.
+# runs the current solution/ versions last.
 #
-# Usage: bash scripts/batch_eval.sh
+# Usage: bash scripts/batch_eval.sh [--no-profile]
 
 cd "$(git rev-parse --show-toplevel)"
+
+PROFILE=true
+if [[ "${1:-}" == "--no-profile" ]]; then
+    PROFILE=false
+fi
 
 RESULTS_DIR="results/batch_eval"
 BENCH_DIR="$RESULTS_DIR/benchmarks"
@@ -47,11 +52,16 @@ run_kernel() {
     local kernel_id="$1"
     echo ""
     echo "============================================"
-    echo "  [$kernel_id] Benchmark"
+    echo "  [$kernel_id] Benchmark + Profile"
     echo "============================================"
 
     echo "--- [$kernel_id] benchmark ---"
     uv run modal run scripts/run_modal.py 2>&1 | tee "$BENCH_DIR/${kernel_id}.txt" || true
+
+    if [[ "$PROFILE" == true ]]; then
+        echo "--- [$kernel_id] profile ---"
+        uv run modal run scripts/profile_modal.py 2>&1 | tee "$BENCH_DIR/${kernel_id}_profile.txt" || true
+    fi
 }
 
 # ---------- main ----------
@@ -94,3 +104,6 @@ echo "============================================"
 echo ""
 echo "Benchmarks:"
 ls -1 "$BENCH_DIR/" 2>/dev/null || echo "  (none)"
+echo ""
+echo "Profiles:"
+find profiles -name "profile.summary.json" -newer "$BENCH_DIR" 2>/dev/null | sort || echo "  (none)"

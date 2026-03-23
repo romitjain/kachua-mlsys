@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <cmath>
 
-constexpr int kSplitV = 8;
+constexpr int kSplitV = 4;
 
 __device__ __forceinline__ float sigmoid(float x) {
     // Stable sigmoid
@@ -275,12 +275,11 @@ extern "C" cudaError_t launch_gdn(
 
 #ifndef TORCH_EXTENSION_NAME
 int main() {
-    constexpr int B = 1;
+    constexpr int B = 2;
     constexpr int T = 1;
-    // Official decode contest shape: q/k heads = 4, v heads = 8.
-    constexpr int num_q_heads = 4;
-    constexpr int num_k_heads = 4;
-    constexpr int num_v_heads = 8;
+    constexpr int num_q_heads = 16;
+    constexpr int num_k_heads = 16;
+    constexpr int num_v_heads = 32;
     constexpr int K = 128;
     constexpr int V = 128;
 
@@ -414,6 +413,6 @@ void launch_gdn_torch(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn CUDA kernel");
+    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn_v1 CUDA kernel");
 }
 #endif  // TORCH_EXTENSION_NAME

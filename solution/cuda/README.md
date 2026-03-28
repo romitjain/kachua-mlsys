@@ -252,3 +252,11 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload c40fb468...: PASSED | 12.589 µs | 92.69x speedup | abs_err=1.22e-04, rel_err=1.48e-01
 ```
 </details>
+
+Learnings on why v3 is better:
+
+v3 kernel issues a single warp and process 8 corresponding output rows.
+
+1. 8 rows per block - each kernel is doing more work. Even though for v2 a single kernel needed to do less work, and occupancy was higher, v3 still wins because of the block size (32, 1). Each block has 1 warp working on 8 output rows.
+2. The major win is that per row, v3 kernel is doing less work. For eg: gate, beta calculations are done once per warp and used for all 8 rows. In v2 (block dims = (32, 8)), a single thread per row calculated it and broadcasted it within the warp.
+3. For 8 rows of the same head, q, k, gate scalars, indexing math, and reduction setup are mostly shared. v3 amortizes the invariant work.

@@ -24,10 +24,10 @@ constexpr int kSplitV = 8;
 __device__ __forceinline__ float sigmoid(float x) {
     // Stable sigmoid
     if (x >= 0.0f) {
-        float z = expf(-x);
+        float z = __expf(-x);
         return 1.0f / (1.0f + z);
     } else {
-        float z = expf(x);
+        float z = __expf(x);
         return z / (1.0f + z);
     }
 }
@@ -130,7 +130,7 @@ __global__ void gdn_v1(
     }
 }
 
-__global__ void gdn_decode_kernel(
+__global__ void gdn_v2(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v,
@@ -156,7 +156,7 @@ __global__ void gdn_decode_kernel(
 
     if (threadIdx.x == 0) {
         float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
-        gate = expf(-expf(A_log[common_scalar_offset]) * log1pf(expf(x)));
+        gate = __expf(-__expf(A_log[common_scalar_offset]) * __logf(1.0 + __expf(x)));
         beta = sigmoid(__bfloat162float(b[common_scalar_offset]));
     }
 
@@ -229,48 +229,104 @@ __global__ void gdn_decode_kernel(
     }
 }
 
-extern "C" cudaError_t launch_gdn(
-    const __nv_bfloat16* q,
-    const __nv_bfloat16* k,
-    const __nv_bfloat16* v,
-    const float* state,
-    const float* A_log,
-    const __nv_bfloat16* a,
-    const float* dt_bias,
-    const __nv_bfloat16* b,
-    __nv_bfloat16* out,
-    float* new_state,
+__global__ void gdn_v3(
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const float *__restrict__ state,
+    const float *__restrict__ A_log,
+    const __nv_bfloat16 *__restrict__ a,
+    const float *__restrict__ dt_bias,
+    const __nv_bfloat16 *__restrict__ b,
+    __nv_bfloat16 *__restrict__ out,
+    float *__restrict__ new_state,
     int B,
     int num_v_heads,
     int num_k_heads,
     int K,
     int V,
-    float scale,
-    cudaStream_t stream
+    float scale
 ) {
+    int common_scalar_offset = num_v_heads*blockIdx.x + blockIdx.y;
+    int qk_head_factor = num_v_heads/num_k_heads;
 
-    dim3 threads_per_block(32, kSplitV);
-    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
+    float gate;
+    float beta;
 
-    gdn_decode_kernel<<<grid_size, threads_per_block, 0, stream>>>(
-        q,
-        k,
-        v,
-        state,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        out,
-        new_state,
-        B,
-        num_v_heads,
-        num_k_heads,
-        K,
-        V,
-        scale
-    );
-    return cudaGetLastError();
+    if (threadIdx.x == 0) {
+        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
+        gate = __expf(-__expf(A_log[common_scalar_offset]) * __logf(1.0 + __expf(x)));
+        beta = sigmoid(__bfloat162float(b[common_scalar_offset]));
+    }
+
+    gate = __shfl_sync(0xffffffff, gate, 0);
+    beta = __shfl_sync(0xffffffff, beta, 0);
+
+    int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
+    int v_offset = common_scalar_offset*V;
+    int local_v = blockIdx.z*kSplitV + threadIdx.y;
+    // Get the read offset for state matrix (global)
+    // State matrix is BxHxVxK, we want VxK for every batch,head combination
+    int state_read = common_scalar_offset*V*K + local_v*K;
+
+    // Read state through the read-only path and stream write-back to avoid cache pollution.
+    int local_k = threadIdx.x*4;
+    const float4 s4 = __ldg(reinterpret_cast<const float4*>(&state[state_read+local_k]));
+
+    // For bf16 loads, I have to do more things
+    // Load 4 bf16 values, split in to float2 values
+    // (why cant I save to a single float4) - because the nv_bfloat162 gives me 2 pair of bfloat16
+    // hmm, if there was nv_bfloat164, then it would have been possible to convert to float4 directly
+    const nv_bfloat162* k_cache4 = reinterpret_cast<const nv_bfloat162*> (&k[k_offset+local_k]);
+    float2 k_cache01 = __bfloat1622float2(k_cache4[0]);
+    float2 k_cache02 = __bfloat1622float2(k_cache4[1]);
+
+    float old_v_accum = 0.0f;
+    old_v_accum += gate*s4.x*k_cache01.x;
+    old_v_accum += gate*s4.y*k_cache01.y;
+    old_v_accum += gate*s4.z*k_cache02.x;
+    old_v_accum += gate*s4.w*k_cache02.y;
+
+# pragma unroll
+    // Warp reduction
+    for (int off = 16; off > 0; off >>= 1) {
+        old_v_accum += __shfl_down_sync(0xffffffff, old_v_accum, off);
+    }
+
+    float old_v = __shfl_sync(0xffffffff, old_v_accum, 0);
+    float new_v = 0.0f;
+    if (threadIdx.x == 0) {
+        new_v = beta * __bfloat162float(v[v_offset + local_v]) + (1.0f - beta) * old_v;
+    }
+    new_v = __shfl_sync(0xffffffff, new_v, 0);
+
+    float valx = gate*s4.x - old_v*k_cache01.x + new_v*k_cache01.x;
+    float valy = gate*s4.y - old_v*k_cache01.y + new_v*k_cache01.y;
+    float valz = gate*s4.z - old_v*k_cache02.x + new_v*k_cache02.x;
+    float valw = gate*s4.w - old_v*k_cache02.y + new_v*k_cache02.y;
+
+    const float4 new_state_vec = make_float4(valx, valy, valz, valw);
+    __stcs(reinterpret_cast<float4*>(&new_state[state_read+local_k]), new_state_vec);
+
+    const nv_bfloat162* q_cache4 = reinterpret_cast<const nv_bfloat162*> (&q[k_offset+local_k]);
+    float2 q_cache01 = __bfloat1622float2(q_cache4[0]);
+    float2 q_cache02 = __bfloat1622float2(q_cache4[1]);
+
+    float out_acc = 0.0f;
+    out_acc += scale * valx * q_cache01.x;
+    out_acc += scale * valy * q_cache01.y;
+    out_acc += scale * valz * q_cache02.x;
+    out_acc += scale * valw * q_cache02.y;
+
+# pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        out_acc += __shfl_down_sync(0xffffffff, out_acc, off);
+    }
+
+    // Write out
+    if (threadIdx.x == 0) {
+        out[v_offset+local_v] = __float2bfloat16_rn(out_acc);
+    }
 }
 
 #ifndef TORCH_EXTENSION_NAME
@@ -329,7 +385,9 @@ int main() {
     }
     for (size_t i = 0; i < out_elems; ++i) out[i] = __float2bfloat16_rn(0.0f);
 
-    const cudaError_t launch_err = launch_gdn(
+    dim3 threads_per_block(32, kSplitV);
+    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
+    gdn_v3<<<grid_size, threads_per_block, 0, nullptr>>>(
         q,
         k,
         v,
@@ -345,9 +403,9 @@ int main() {
         num_k_heads,
         K,
         V,
-        scale,
-        nullptr
+        scale
     );
+    const cudaError_t launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
         std::printf("launch_gdn failed: %s\n", cudaGetErrorString(launch_err));
         return 1;
@@ -372,7 +430,7 @@ int main() {
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-void launch_gdn_torch(
+void launch_gdn(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -392,7 +450,9 @@ void launch_gdn_torch(
     const int V = static_cast<int>(v.size(3));
 
     const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
-    (void)launch_gdn(
+    dim3 threads_per_block(32, kSplitV);
+    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
+    gdn_v3<<<grid_size, threads_per_block, 0, stream.stream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
@@ -408,12 +468,11 @@ void launch_gdn_torch(
         num_k_heads,
         K,
         V,
-        scale,
-        stream.stream()
+        scale
     );
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_gdn", &launch_gdn_torch, "Launch gdn CUDA kernel");
+    m.def("launch_gdn", &launch_gdn, "Launch gdn CUDA kernel");
 }
 #endif  // TORCH_EXTENSION_NAME

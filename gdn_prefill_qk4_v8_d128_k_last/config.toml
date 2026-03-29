@@ -1,0 +1,8 @@
+[solution]
+name = "gdn-prefill-triton-v1"
+definition = "gdn_prefill_qk4_v8_d128_k_last"
+author = "kachua"
+
+[build]
+language = "triton"
+entry_point = "kernel.py::launch_gdn"

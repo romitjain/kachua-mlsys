@@ -223,7 +223,7 @@ __marimo__/
 .cursor/
 .worktrees/
 mlsys26-contest/
-profiles/
+**/profiles/
 results/
 AGENTS.md
 CLAUDE.md

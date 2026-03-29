@@ -51,7 +51,7 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
         K=HEAD_DIM, V_DIM=HEAD_DIM,
         NUM_V_HEADS=NUM_V_HEADS, NUM_K_HEADS=NUM_K_HEADS,
         GVA_RATIO=GVA_RATIO, BV=BV, N_V_TILES=N_V_TILES,
-        num_warps=8, num_stages=4,
+        num_warps=1, num_stages=4,
     )
 
 

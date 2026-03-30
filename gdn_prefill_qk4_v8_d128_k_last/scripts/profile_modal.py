@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import subprocess
 import textwrap
@@ -21,12 +20,24 @@ PROFILE_VOLUME_NAME = "kachua-gdn-profiles"
 
 
 @dataclass(frozen=True)
+class ProfileShape:
+    """Describe the synthetic shape used for one profiling run."""
+
+    batch_size: int
+    total_seq_len: int
+    num_seqs: int
+    cu_seqlens_len: int
+
+
+@dataclass(frozen=True)
 class ProfileTarget:
     """Describe the implementation selected by config.toml."""
 
     backend: str
+    problem_kind: str
     entry_file: str
     entry_function: str
+    runner_function: str
     ncu_kernel_regex: str
     source_files: tuple[str, ...]
     binding: str | None = None
@@ -38,44 +49,129 @@ def load_config() -> dict:
         return tomllib.load(config_file)
 
 
+def resolve_problem_kind(definition_name: str) -> str:
+    """Resolve whether the active definition is decode or prefill."""
+    if "_decode_" in definition_name:
+        return "decode"
+    if "_prefill_" in definition_name:
+        return "prefill"
+    raise ValueError(
+        f"Unsupported definition '{definition_name}'. Expected a decode or prefill definition."
+    )
+
+
+def kernel_regex_for_problem(problem_kind: str) -> str:
+    """Return the Nsight Compute kernel-name regex for the selected problem."""
+    if problem_kind == "decode":
+        return "regex:.*gdn_decode_kernel.*"
+    if problem_kind == "prefill":
+        return "regex:.*gdn_prefill_kernel.*"
+    raise ValueError(f"Unsupported problem kind: {problem_kind}")
+
+
 def resolve_profile_target() -> ProfileTarget:
     """Resolve the active config.toml entry to a profile target."""
-    build = load_config()["build"]
+    config = load_config()
+    build = config["build"]
+    definition_name = config["solution"]["definition"]
     entry_file, entry_function = build["entry_point"].split("::", maxsplit=1)
     language = build["language"]
+    problem_kind = resolve_problem_kind(definition_name)
+    kernel_regex = kernel_regex_for_problem(problem_kind)
 
     if language == "cuda":
-        kernel_regex = "regex:.*gdn_decode_kernel.*"
         binding = build.get("binding")
-        source_files = [f"solution/cuda/{entry_file}", "solution/cuda/binding.py"]
         return ProfileTarget(
             backend="cuda",
+            problem_kind=problem_kind,
             entry_file=entry_file,
-            entry_function="kernel",
+            entry_function=entry_function,
+            runner_function="kernel" if binding == "torch" else entry_function,
             ncu_kernel_regex=kernel_regex,
-            source_files=tuple(source_files),
+            source_files=(f"solution/cuda/{entry_file}", "solution/cuda/binding.py"),
             binding=binding,
         )
 
     if language == "triton":
         return ProfileTarget(
             backend="triton",
+            problem_kind=problem_kind,
             entry_file=entry_file,
             entry_function=entry_function,
-            ncu_kernel_regex="regex:.*gdn_decode_kernel.*",
+            runner_function=entry_function,
+            ncu_kernel_regex=kernel_regex,
             source_files=(f"solution/triton/{entry_file}",),
         )
 
     if language == "cute":
         return ProfileTarget(
             backend="cute",
+            problem_kind=problem_kind,
             entry_file=entry_file,
             entry_function=entry_function,
-            ncu_kernel_regex="regex:.*gdn_decode_kernel.*",
+            runner_function=entry_function,
+            ncu_kernel_regex=kernel_regex,
             source_files=(f"solution/cute/{entry_file}",),
         )
 
     raise ValueError(f"Unsupported language in config.toml: {language}")
+
+
+def require_positive(name: str, value: int) -> None:
+    """Require a positive integer CLI argument."""
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1, got {value}")
+
+
+def resolve_cu_seqlens_len(num_seqs: int, cu_seqlens_len: int) -> int:
+    """Resolve and validate the prefill cu_seqlens length."""
+    expected = num_seqs + 1
+    if cu_seqlens_len <= 0:
+        return expected
+    if cu_seqlens_len != expected:
+        raise ValueError(
+            "cu_seqlens_len must equal num_seqs + 1 for packed prefill inputs. "
+            f"Expected {expected}, got {cu_seqlens_len}."
+        )
+    return cu_seqlens_len
+
+
+def build_profile_shape(
+    target: ProfileTarget,
+    batch_size: int,
+    total_seq_len: int,
+    num_seqs: int,
+    cu_seqlens_len: int,
+) -> ProfileShape:
+    """Build the synthetic shape for the selected decode or prefill target."""
+    if target.problem_kind == "decode":
+        require_positive("batch_size", batch_size)
+        return ProfileShape(
+            batch_size=batch_size,
+            total_seq_len=total_seq_len,
+            num_seqs=num_seqs,
+            cu_seqlens_len=resolve_cu_seqlens_len(num_seqs, cu_seqlens_len),
+        )
+
+    require_positive("total_seq_len", total_seq_len)
+    require_positive("num_seqs", num_seqs)
+    return ProfileShape(
+        batch_size=batch_size,
+        total_seq_len=total_seq_len,
+        num_seqs=num_seqs,
+        cu_seqlens_len=resolve_cu_seqlens_len(num_seqs, cu_seqlens_len),
+    )
+
+
+def format_run_id(target: ProfileTarget, shape: ProfileShape, timestamp: str) -> str:
+    """Format a readable run id for one profiling invocation."""
+    if target.problem_kind == "decode":
+        return f"{timestamp}_b{shape.batch_size}"
+    return (
+        f"{timestamp}_t{shape.total_seq_len}"
+        f"_n{shape.num_seqs}"
+        f"_c{shape.cu_seqlens_len}"
+    )
 
 
 def read_profile_sources(target: ProfileTarget) -> dict[str, str]:
@@ -86,7 +182,12 @@ def read_profile_sources(target: ProfileTarget) -> dict[str, str]:
     return sources
 
 
-def build_runner_source(target: ProfileTarget, batch_size: int, warmup: int, seed: int) -> str:
+def build_runner_source(
+    target: ProfileTarget,
+    shape: ProfileShape,
+    warmup: int,
+    seed: int,
+) -> str:
     """Build the Python runner executed under Nsight Compute inside Modal."""
     base = """
 import importlib.util
@@ -113,6 +214,106 @@ def prepend_env_path(name: str, value: str):
     os.environ[name] = f"{value}:{current}" if current else value
 
 
+def build_prefill_cu_seqlens(total_seq_len: int, num_seqs: int, expected_len: int, device: str):
+    actual_len = num_seqs + 1
+    if expected_len != actual_len:
+        raise ValueError(
+            "cu_seqlens length mismatch: "
+            f"expected {actual_len}, got {expected_len}"
+        )
+    lengths = torch.full((num_seqs,), total_seq_len // num_seqs, dtype=torch.int64)
+    lengths[: total_seq_len % num_seqs] += 1
+    cu_seqlens = torch.zeros(actual_len, dtype=torch.int64, device=device)
+    cu_seqlens[1:] = torch.cumsum(lengths.to(device), dim=0)
+    return cu_seqlens
+
+
+def build_decode_inputs(device: str):
+    q = torch.randn(BATCH_SIZE, 1, NUM_Q_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
+    k = torch.randn(BATCH_SIZE, 1, NUM_K_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
+    v = torch.randn(BATCH_SIZE, 1, NUM_V_HEADS, V_DIM, device=device, dtype=torch.bfloat16)
+    state = torch.randn(
+        BATCH_SIZE,
+        NUM_V_HEADS,
+        V_DIM,
+        K_DIM,
+        device=device,
+        dtype=torch.float32,
+    )
+    A_log = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
+    a = torch.randn(BATCH_SIZE, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+    dt_bias = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
+    b = torch.randn(BATCH_SIZE, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "state": state,
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "b": b,
+        "cu_seqlens": None,
+    }
+
+
+def build_prefill_inputs(device: str):
+    q = torch.randn(TOTAL_SEQ_LEN, NUM_Q_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
+    k = torch.randn(TOTAL_SEQ_LEN, NUM_K_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
+    v = torch.randn(TOTAL_SEQ_LEN, NUM_V_HEADS, V_DIM, device=device, dtype=torch.bfloat16)
+    state = torch.randn(
+        NUM_SEQS,
+        NUM_V_HEADS,
+        V_DIM,
+        K_DIM,
+        device=device,
+        dtype=torch.float32,
+    )
+    A_log = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
+    a = torch.randn(TOTAL_SEQ_LEN, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+    dt_bias = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
+    b = torch.randn(TOTAL_SEQ_LEN, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+    cu_seqlens = build_prefill_cu_seqlens(
+        TOTAL_SEQ_LEN,
+        NUM_SEQS,
+        CU_SEQLENS_LEN,
+        device,
+    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "state": state,
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "b": b,
+        "cu_seqlens": cu_seqlens,
+    }
+
+
+def allocate_outputs(problem_kind: str, state: torch.Tensor, device: str):
+    if problem_kind == "decode":
+        output = torch.empty(
+            (BATCH_SIZE, NUM_V_HEADS, V_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        return output, torch.empty_like(state)
+
+    output = torch.empty(
+        (TOTAL_SEQ_LEN, NUM_V_HEADS, V_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    new_state = torch.empty(
+        (NUM_SEQS, NUM_V_HEADS, V_DIM, K_DIM),
+        dtype=torch.float32,
+        device=device,
+    )
+    return output, new_state
+
+
 spec = importlib.util.find_spec("tvm_ffi")
 if spec is None or not spec.submodule_search_locations:
     raise RuntimeError("apache-tvm-ffi must be installed in the profiling image")
@@ -135,22 +336,29 @@ sys.modules["tvm_ffi"] = stub_tvm_ffi
 
 torch.manual_seed(SEED)
 device = "cuda"
-B = BATCH_SIZE
 K_DIM = 128
 V_DIM = 128
 NUM_Q_HEADS = 4
 NUM_K_HEADS = 4
 NUM_V_HEADS = 8
-
-q = torch.randn(B, 1, NUM_Q_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
-k = torch.randn(B, 1, NUM_K_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
-v = torch.randn(B, 1, NUM_V_HEADS, V_DIM, device=device, dtype=torch.bfloat16)
-state = torch.randn(B, NUM_V_HEADS, V_DIM, K_DIM, device=device, dtype=torch.float32)
-A_log = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
-a = torch.randn(B, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
-dt_bias = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
-b = torch.randn(B, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
 scale = 1.0 / (K_DIM ** 0.5)
+
+if PROBLEM_KIND == "decode":
+    inputs = build_decode_inputs(device)
+elif PROBLEM_KIND == "prefill":
+    inputs = build_prefill_inputs(device)
+else:
+    raise ValueError(f"Unsupported problem kind: {PROBLEM_KIND}")
+
+q = inputs["q"]
+k = inputs["k"]
+v = inputs["v"]
+state = inputs["state"]
+A_log = inputs["A_log"]
+a = inputs["a"]
+dt_bias = inputs["dt_bias"]
+b = inputs["b"]
+cu_seqlens = inputs["cu_seqlens"]
 """
 
     if target.backend == "cuda" and target.binding == "torch":
@@ -171,27 +379,33 @@ def profile_load(*args, **kwargs):
 cpp_extension.load = profile_load
 
 binding = load_module("cuda_binding", str(Path(WORKSPACE) / "solution/cuda/binding.py"))
-run_kernel = getattr(binding, ENTRY_FUNCTION)
+run_kernel = getattr(binding, RUNNER_FUNCTION)
 
-run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+
+def invoke():
+    if PROBLEM_KIND == "decode":
+        run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+        return
+    run_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+
+
+invoke()
 torch.cuda.synchronize()
 
 for _ in range(WARMUP):
-    run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+    invoke()
 torch.cuda.synchronize()
 
-run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+invoke()
 torch.cuda.synchronize()
 """
     elif target.backend == "cuda":
         body = """
 import subprocess as _sp
 
-# Undo the tvm_ffi stub — need real tvm_ffi for C++ function registration
 del sys.modules["tvm_ffi"]
 import tvm_ffi
 
-# Compile kernel.cu into a shared object with TVM FFI headers
 kernel_src = str(Path(WORKSPACE) / "solution/cuda" / ENTRY_FILE)
 so_path = "/tmp/gdn_kernel.so"
 nvcc_cmd = [
@@ -209,15 +423,31 @@ if nvcc_result.returncode != 0:
     print("NVCC STDERR:", nvcc_result.stderr)
     raise RuntimeError(f"nvcc failed with exit code {nvcc_result.returncode}")
 
-# Load .so via tvm_ffi (keeps handle alive, registers exported functions)
 _kernel_mod = tvm_ffi.load_module(so_path)
-kernel_func = _kernel_mod[ENTRY_FUNCTION]
+kernel_func = _kernel_mod[RUNNER_FUNCTION]
 
-output = torch.empty(B, 1, NUM_V_HEADS, V_DIM, dtype=torch.bfloat16, device=device)
-new_state = torch.empty_like(state)
+output, new_state = allocate_outputs(PROBLEM_KIND, state, device)
+
 
 def invoke():
-    kernel_func(q, k, v, state, A_log, a, dt_bias, b, float(scale), output, new_state)
+    if PROBLEM_KIND == "decode":
+        kernel_func(q, k, v, state, A_log, a, dt_bias, b, float(scale), output, new_state)
+        return
+    kernel_func(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        float(scale),
+        output,
+        new_state,
+    )
+
 
 invoke()
 torch.cuda.synchronize()
@@ -236,12 +466,29 @@ kernel_module = load_module(
     "{target.backend}_kernel",
     str(Path(WORKSPACE) / "solution/{backend_dir}" / ENTRY_FILE),
 )
-run_kernel = getattr(kernel_module, ENTRY_FUNCTION)
+run_kernel = getattr(kernel_module, RUNNER_FUNCTION)
+
 
 def invoke():
-    output = torch.empty((B, NUM_V_HEADS, V_DIM), dtype=torch.bfloat16, device=device)
-    new_state = torch.empty_like(state)
-    run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state)
+    output, new_state = allocate_outputs(PROBLEM_KIND, state, device)
+    if PROBLEM_KIND == "decode":
+        run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state)
+        return
+    run_kernel(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        scale,
+        output,
+        new_state,
+    )
+
 
 invoke()
 torch.cuda.synchronize()
@@ -254,31 +501,23 @@ invoke()
 torch.cuda.synchronize()
 """
     else:
-        body = f"""
-raise ValueError("Unsupported backend for profiling: {target.backend}")
-"""
+        body = f'raise ValueError("Unsupported backend for profiling: {target.backend}")\n'
 
     prelude = textwrap.dedent(
         f"""
         WORKSPACE = {str(REMOTE_WORKSPACE)!r}
         ENTRY_FILE = {target.entry_file!r}
-        ENTRY_FUNCTION = {target.entry_function!r}
-        BATCH_SIZE = {batch_size}
+        RUNNER_FUNCTION = {target.runner_function!r}
+        PROBLEM_KIND = {target.problem_kind!r}
+        BATCH_SIZE = {shape.batch_size}
+        TOTAL_SEQ_LEN = {shape.total_seq_len}
+        NUM_SEQS = {shape.num_seqs}
+        CU_SEQLENS_LEN = {shape.cu_seqlens_len}
         WARMUP = {warmup}
         SEED = {seed}
         """
     )
     return textwrap.dedent(prelude + base + body)
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-size", type=int, default=1, help="Synthetic batch size")
-    parser.add_argument("--warmup", type=int, default=5, help="Warmup launches before profiling")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed for synthetic inputs")
-    parser.add_argument("--ncu-set", default="full", help="Nsight Compute metric set")
-    return parser.parse_args()
 
 
 def to_volume_path(remote_path: str) -> str:
@@ -550,6 +789,9 @@ if modal is not None:
     @app.local_entrypoint()
     def main(
         batch_size: int = 1,
+        total_seq_len: int = 128,
+        num_seqs: int = 4,
+        cu_seqlens_len: int = 0,
         warmup: int = 5,
         seed: int = 7,
         ncu_set: str = "basic",
@@ -557,7 +799,14 @@ if modal is not None:
         from datetime import datetime
 
         target = resolve_profile_target()
-        run_id = f"{datetime.now():%Y%m%d_%H%M%S}_b{batch_size}"
+        shape = build_profile_shape(
+            target=target,
+            batch_size=batch_size,
+            total_seq_len=total_seq_len,
+            num_seqs=num_seqs,
+            cu_seqlens_len=cu_seqlens_len,
+        )
+        run_id = format_run_id(target, shape, f"{datetime.now():%Y%m%d_%H%M%S}")
 
         result = run_profile.remote(
             target_json=json.dumps(
@@ -568,7 +817,12 @@ if modal is not None:
                 }
             ),
             source_files=read_profile_sources(target),
-            runner_source=build_runner_source(target, batch_size=batch_size, warmup=warmup, seed=seed),
+            runner_source=build_runner_source(
+                target=target,
+                shape=shape,
+                warmup=warmup,
+                seed=seed,
+            ),
             ncu_set=ncu_set,
             warmup=warmup,
             run_id=run_id,
@@ -640,7 +894,22 @@ if modal is not None:
                 if cleanup.returncode != 0 and cleanup.stderr:
                     print(cleanup.stderr)
 
-        print(f"Profiled {target.backend} from config entry {target.entry_file}::{target.entry_function}")
+        shape_summary = (
+            f"batch_size={shape.batch_size}"
+            if target.problem_kind == "decode"
+            else (
+                "total_seq_len="
+                f"{shape.total_seq_len}, num_seqs={shape.num_seqs}, "
+                f"cu_seqlens_len={shape.cu_seqlens_len}"
+            )
+        )
+
+        print(
+            "Profiled "
+            f"{target.backend} {target.problem_kind} from config entry "
+            f"{target.entry_file}::{target.entry_function}"
+        )
+        print(f"shape: {shape_summary}")
         print(f"ncu exit code: {result['exit_code']}")
         for local_path in downloaded_paths:
             print(f"downloaded profile artifact to {local_path}")

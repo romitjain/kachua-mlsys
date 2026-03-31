@@ -16,6 +16,7 @@ from typing import Callable
 
 import safetensors.torch
 import torch
+from dotenv import load_dotenv
 
 try:
     import tomllib
@@ -50,22 +51,6 @@ def _is_trace_root(path: Path) -> bool:
     return (path / "definitions").is_dir() and (path / "workloads").is_dir()
 
 
-def _load_env_file(env_path: Path) -> None:
-    if not env_path.exists():
-        return
-
-    for raw_line in env_path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :]
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-
 def resolve_trace_set_path(path: str | Path) -> Path:
     root = Path(path).expanduser()
 
@@ -85,11 +70,8 @@ def resolve_trace_set_path(path: str | Path) -> Path:
     )
 
 
-def get_trace_set_path(explicit_path: str | None = None) -> Path:
-    if explicit_path is not None:
-        return resolve_trace_set_path(explicit_path)
-
-    _load_env_file(PROJECT_ROOT / ".env")
+def get_trace_set_path() -> Path:
+    load_dotenv(PROJECT_ROOT / ".env")
     fib_dataset_path = os.environ.get("FIB_DATASET_PATH")
     if not fib_dataset_path:
         raise EnvironmentError(
@@ -193,14 +175,19 @@ def _load_workload(trace_root: Path, definition_name: str, workload_idx: int) ->
     raise IndexError(f"Workload index {workload_idx} out of range for '{definition_name}'")
 
 
+def _count_workloads(trace_root: Path, definition_name: str) -> int:
+    workload_path = _find_workload_path(trace_root, definition_name)
+    with open(workload_path, "r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
 def load_workload_tensors(
     definition_name: str,
     *,
-    trace_set_path: str | None = None,
     workload_idx: int = 0,
     device: str = "cuda",
 ) -> tuple[dict, list[str]]:
-    resolved_trace_set_path = get_trace_set_path(trace_set_path)
+    resolved_trace_set_path = get_trace_set_path()
     definition = _load_definition(resolved_trace_set_path, definition_name)
     workload = _load_workload(resolved_trace_set_path, definition_name, workload_idx)
 
@@ -243,7 +230,6 @@ def load_workload_tensors(
 
 def run_benchmark(
     *,
-    trace_set_path: str | None = None,
     workload_idx: int = 0,
     device: str = "cuda",
 ) -> dict:
@@ -255,7 +241,6 @@ def run_benchmark(
     solution_name, definition_name, kernel = load_kernel()
     tensors, input_names = load_workload_tensors(
         definition_name,
-        trace_set_path=trace_set_path,
         workload_idx=workload_idx,
         device=device,
     )
@@ -282,17 +267,19 @@ def run_benchmark(
                 enable_cupti=True,
             )
         if any("falling back to cuda events" in str(w.message).lower() for w in caught_warnings):
-            timing_backend = "cuda_events"
+            timing_backend = "cuda_graph"# "cuda_events"
     except Exception as exc:
         exc_text = str(exc).lower()
         if "cupti" not in exc_text and "cuda 13.0 or later driver is supported" not in exc_text:
             raise
-        timing_backend = "cuda_events"
-        print(f"CUPTI timing unavailable ({exc}). Falling back to CUDA events.")
+        timing_backend = "cuda_graph" # "cuda_events"
+        fallback_backend = "CUDA graph timing" # "CUDA events"
+        print(f"CUPTI timing unavailable ({exc}). Falling back to {fallback_backend}.")
         times_ms = bench_gpu_time(
             fn=lambda: kernel(*call_args),
             cold_l2_cache=True,
             enable_cupti=False,
+            use_cuda_graph=True,
         )
     times_us = [t * 1000.0 for t in times_ms]
 
@@ -321,27 +308,29 @@ def main():
         description="Benchmark the current solution using FlashInfer bench_gpu_time"
     )
     parser.add_argument(
-        "--trace-set-path",
-        default=None,
-        help="Path to flashinfer-trace root. Defaults to FIB_DATASET_PATH.",
-    )
-    parser.add_argument(
         "--workload-idx",
         type=int,
         default=0,
-        help="Workload index inside the selected definition (default: 0).",
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda",
-        help="Torch device string for generated inputs (default: cuda).",
+        help="Workload index inside the selected definition, or -1 for 'all' (default: 0).",
     )
     args = parser.parse_args()
 
+    workload_idx = int(args.workload_idx)
+    if workload_idx < 0:
+        _, definition_name, _ = load_kernel()
+        trace_root = get_trace_set_path()
+        num_workloads = _count_workloads(trace_root, definition_name)
+        print(f"Running timing for all {num_workloads} workloads")
+        for workload_idx in range(num_workloads):
+            run_benchmark(
+                workload_idx=workload_idx,
+                device="cuda:0",
+            )
+        return
+
     run_benchmark(
-        trace_set_path=args.trace_set_path,
-        workload_idx=args.workload_idx,
-        device=args.device,
+        workload_idx=workload_idx,
+        device="cuda:0",
     )
 
 

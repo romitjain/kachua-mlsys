@@ -26,6 +26,7 @@ image = (
         "flashinfer-python",
         "pandas",
         "cupti-python",
+        "python-dotenv",
     )
     .env({"FIB_DATASET_PATH": TRACE_SET_PATH})
     .add_local_file("config.toml", remote_path="/root/config.toml")
@@ -47,15 +48,25 @@ app = modal.App("fi-timing-gdn")
 def run_fi_timing(workload_idx: int = 0):
     sys.path.insert(0, "/root")
 
-    from scripts.bench_fi_timing import run_benchmark
+    from scripts.bench_fi_timing import _count_workloads, get_trace_set_path, load_kernel, run_benchmark
 
-    return run_benchmark(trace_set_path=TRACE_SET_PATH, workload_idx=workload_idx)
+    if workload_idx < 0:
+        _, definition_name, _ = load_kernel()
+        trace_root = get_trace_set_path()
+        num_workloads = _count_workloads(trace_root, definition_name)
+        print(f"Running timing for all {num_workloads} workloads")
+        return [run_benchmark(workload_idx=idx) for idx in range(num_workloads)]
+
+    return run_benchmark(workload_idx=workload_idx)
 
 
 @app.local_entrypoint()
 def main(workload_idx: int = 0):
     print(f"Running FlashInfer bench_gpu_time on Modal B200 (workload_idx={workload_idx})")
     result = run_fi_timing.remote(workload_idx)
+    if workload_idx < 0:
+        print(f"Completed Modal timing for {len(result)} workloads")
+        return
     print(
         f"{result['solution_name']}: median={result['median_us']:.2f} us "
         f"(min={result['min_us']:.2f} us, max={result['max_us']:.2f} us, n={result['iters']})"

@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cmath>
@@ -155,8 +156,8 @@ __global__ void gdn_v2(
     float beta;
 
     if (threadIdx.x == 0) {
-        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
-        gate = __expf(-__expf(A_log[common_scalar_offset]) * __logf(1.0 + __expf(x)));
+        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[blockIdx.y];
+        gate = __expf(-__expf(A_log[blockIdx.y]) * __logf(1.0 + __expf(x)));
         beta = sigmoid(__bfloat162float(b[common_scalar_offset]));
     }
 
@@ -250,18 +251,6 @@ __global__ void gdn_v3(
     int common_scalar_offset = num_v_heads*blockIdx.x + blockIdx.y;
     int qk_head_factor = num_v_heads/num_k_heads;
 
-    float gate;
-    float beta;
-
-    if (threadIdx.x == 0) {
-        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
-        gate = __expf(-__expf(A_log[common_scalar_offset]) * __logf(1.0 + __expf(x)));
-        beta = sigmoid(__bfloat162float(b[common_scalar_offset]));
-    }
-
-    gate = __shfl_sync(0xffffffff, gate, 0);
-    beta = __shfl_sync(0xffffffff, beta, 0);
-
     int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
     int v_offset = common_scalar_offset*V;
     int local_v = blockIdx.z*kSplitV + threadIdx.y;
@@ -273,19 +262,59 @@ __global__ void gdn_v3(
     int local_k = threadIdx.x*4;
     const float4 s4 = __ldg(reinterpret_cast<const float4*>(&state[state_read+local_k]));
 
-    // For bf16 loads, I have to do more things
-    // Load 4 bf16 values, split in to float2 values
-    // (why cant I save to a single float4) - because the nv_bfloat162 gives me 2 pair of bfloat16
-    // hmm, if there was nv_bfloat164, then it would have been possible to convert to float4 directly
-    const nv_bfloat162* k_cache4 = reinterpret_cast<const nv_bfloat162*> (&k[k_offset+local_k]);
-    float2 k_cache01 = __bfloat1622float2(k_cache4[0]);
-    float2 k_cache02 = __bfloat1622float2(k_cache4[1]);
+    float v_in = 0.0f;
+    if (threadIdx.x == 0) {
+        v_in = __bfloat162float(v[v_offset + local_v]);
+    }
+
+    uint32_t k_raw0;
+    uint32_t k_raw1;
+    asm volatile(
+        "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+        : "=r"(k_raw0), "=r"(k_raw1)
+        : "l"(k + k_offset + local_k)
+    );
+    __nv_bfloat162 k_pair01 = *reinterpret_cast<__nv_bfloat162*>(&k_raw0);
+    __nv_bfloat162 k_pair23 = *reinterpret_cast<__nv_bfloat162*>(&k_raw1);
+    float k0 = __bfloat162float(k_pair01.x);
+    float k1 = __bfloat162float(k_pair01.y);
+    float k2 = __bfloat162float(k_pair23.x);
+    float k3 = __bfloat162float(k_pair23.y);
+
+    uint32_t q_raw0;
+    uint32_t q_raw1;
+    asm volatile(
+        "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+        : "=r"(q_raw0), "=r"(q_raw1)
+        : "l"(q + k_offset + local_k)
+    );
+    __nv_bfloat162 q_pair01 = *reinterpret_cast<__nv_bfloat162*>(&q_raw0);
+    __nv_bfloat162 q_pair23 = *reinterpret_cast<__nv_bfloat162*>(&q_raw1);
+    float q0 = scale * __bfloat162float(q_pair01.x);
+    float q1 = scale * __bfloat162float(q_pair01.y);
+    float q2 = scale * __bfloat162float(q_pair23.x);
+    float q3 = scale * __bfloat162float(q_pair23.y);
+
+    float gate = 0.0f;
+    float beta = 0.0f;
+    if (threadIdx.x == 0) {
+        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
+        float sp = (x > 20.0f) ? x : __logf(1.0f + __expf(x));
+        gate = __expf(-__expf(A_log[common_scalar_offset]) * sp);
+        beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b[common_scalar_offset])));
+    }
+    gate = __shfl_sync(0xffffffff, gate, 0);
+    beta = __shfl_sync(0xffffffff, beta, 0);
+    float h0 = gate * s4.x;
+    float h1 = gate * s4.y;
+    float h2 = gate * s4.z;
+    float h3 = gate * s4.w;
 
     float old_v_accum = 0.0f;
-    old_v_accum += gate*s4.x*k_cache01.x;
-    old_v_accum += gate*s4.y*k_cache01.y;
-    old_v_accum += gate*s4.z*k_cache02.x;
-    old_v_accum += gate*s4.w*k_cache02.y;
+    old_v_accum = fmaf(k0, h0, old_v_accum);
+    old_v_accum = fmaf(k1, h1, old_v_accum);
+    old_v_accum = fmaf(k2, h2, old_v_accum);
+    old_v_accum = fmaf(k3, h3, old_v_accum);
 
 # pragma unroll
     // Warp reduction
@@ -294,29 +323,25 @@ __global__ void gdn_v3(
     }
 
     float old_v = __shfl_sync(0xffffffff, old_v_accum, 0);
-    float new_v = 0.0f;
+    float dv = 0.0f;
     if (threadIdx.x == 0) {
-        new_v = beta * __bfloat162float(v[v_offset + local_v]) + (1.0f - beta) * old_v;
+        dv = beta * (v_in - old_v);
     }
-    new_v = __shfl_sync(0xffffffff, new_v, 0);
+    dv = __shfl_sync(0xffffffff, dv, 0);
 
-    float valx = gate*s4.x - old_v*k_cache01.x + new_v*k_cache01.x;
-    float valy = gate*s4.y - old_v*k_cache01.y + new_v*k_cache01.y;
-    float valz = gate*s4.z - old_v*k_cache02.x + new_v*k_cache02.x;
-    float valw = gate*s4.w - old_v*k_cache02.y + new_v*k_cache02.y;
+    float valx = fmaf(dv, k0, h0);
+    float valy = fmaf(dv, k1, h1);
+    float valz = fmaf(dv, k2, h2);
+    float valw = fmaf(dv, k3, h3);
 
     const float4 new_state_vec = make_float4(valx, valy, valz, valw);
     __stcs(reinterpret_cast<float4*>(&new_state[state_read+local_k]), new_state_vec);
 
-    const nv_bfloat162* q_cache4 = reinterpret_cast<const nv_bfloat162*> (&q[k_offset+local_k]);
-    float2 q_cache01 = __bfloat1622float2(q_cache4[0]);
-    float2 q_cache02 = __bfloat1622float2(q_cache4[1]);
-
     float out_acc = 0.0f;
-    out_acc += scale * valx * q_cache01.x;
-    out_acc += scale * valy * q_cache01.y;
-    out_acc += scale * valz * q_cache02.x;
-    out_acc += scale * valw * q_cache02.y;
+    out_acc = fmaf(q0, valx, out_acc);
+    out_acc = fmaf(q1, valy, out_acc);
+    out_acc = fmaf(q2, valz, out_acc);
+    out_acc = fmaf(q3, valw, out_acc);
 
 # pragma unroll
     for (int off = 16; off > 0; off >>= 1) {

@@ -34,7 +34,7 @@ Modal has ~20% run-to-run variance due to different B200 instances.
   - Processing 2D tile of state
   - Stride over K dimension inside the kernel
 
-Results
+### Results
 
 ```bash
 gdn_decode_qk4_v8_d128_k_last:
@@ -93,7 +93,8 @@ Stopping app - local entrypoint completed.
 - Remove HMEM<>SMEM load for state
 - SMEM for V and K
 - float4 loads
-- Remove the slowdowns I introduced in v1 (OLD__V and NEW_V in SMEM, beta and gate values stored in SMEM instead of registers)
+- Remove the slowdowns I introduced in v1 (`OLD__V` and `NEW_V` in
+  SMEM, beta and gate values stored in SMEM instead of registers)
 
 ```bash
 gdn_decode_qk4_v8_d128_k_last:
@@ -147,32 +148,45 @@ Stopping app - local entrypoint completed.
 
 ## Kernel 3
 
-Complete rewrite based on 46-experiment optimization campaign (30 CuTeDSL + 16 CUDA).
+Complete rewrite based on a 46-experiment optimization campaign
+(30 CuTeDSL + 16 CUDA).
 
-Architecture: BV=8, 1 warp (32 threads) per block, 128 CTAs for B=1. Direct TVM FFI C binding via `TVM_FFI_DLL_EXPORT_TYPED_FUNC` (zero Python dispatch overhead).
+Architecture: `BV=8`, 1 warp (32 threads) per block, 128 CTAs for `B=1`.
+Direct TVM FFI C binding via `TVM_FFI_DLL_EXPORT_TYPED_FUNC`
+(zero Python dispatch overhead).
 
-Key optimizations:
-1. float4 vectorized state loads via `__ldg` (128-bit coalesced, read-only cache)
-2. Separated load issue from data extraction (maximizes memory-level parallelism)
+### Key Optimizations
+
+1. float4 vectorized state loads via `__ldg`
+   (128-bit coalesced, read-only cache)
+2. Separated load issue from data extraction
+   (maximizes memory-level parallelism)
 3. uint2/uint4 vectorized bf16 q/k/v loads
 4. `__stcs` streaming stores (bypass L2 on write-back)
-5. Paired warp reductions via inline PTX `shfl.sync.bfly` (overlaps 2 shuffle latencies)
+5. Paired warp reductions via inline PTX `shfl.sync.bfly`
+   (overlaps 2 shuffle latencies)
 6. Fused decay + delta rule (gate decay folded into dot-product FMA chain)
-7. Interleaved output computation + state store (overlaps write latency with compute)
+7. Interleaved output computation + state store
+   (overlaps write latency with compute)
 8. `__expf`/`__logf`/`__frcp_rn` fast math intrinsics for gates
 9. All dimensions hardcoded as `constexpr` (compiler constant-folding)
 10. `__launch_bounds__(32, 1)` for maximum register budget per thread
 
-Key insights from campaign:
-- **TVM FFI C binding** (`TVM_FFI_DLL_EXPORT_TYPED_FUNC`) is the #1 speedup — eliminates ALL Python dispatch
-- **L2 persistence HURTS on B200** — the 126MB L2 naturally caches the 524KB state
+### Key Insights From the Campaign
+
+- **TVM FFI C binding** (`TVM_FFI_DLL_EXPORT_TYPED_FUNC`) is the #1
+  speedup: it eliminates all Python dispatch overhead.
+- **L2 persistence hurts on B200**: the 126 MB L2 naturally caches the
+  524 KB state.
 - **Shared memory staging HURTS** for this latency-bound kernel
-- Kernel is **instruction-latency-limited** at ~25% occupancy, NOT bandwidth-limited (<2% HBM BW at B=1)
+- Kernel is **instruction-latency-limited** at ~25% occupancy, not
+  bandwidth-limited (<2% HBM BW at `B=1`)
 
+<!-- markdownlint-disable MD033 -->
 <details>
-<summary>Run 1 (median 91.2x, 8.3 µs)</summary>
+<summary>Run 1: median 91.2x, 8.3 µs</summary>
 
-```
+```bash
 gdn_decode_qk4_v8_d128_k_last:
   Workload 6700a748...: PASSED | 8.294 µs | 86.13x speedup | abs_err=5.34e-05, rel_err=2.20e+00
   Workload d66ae544...: PASSED | 8.242 µs | 86.65x speedup | abs_err=3.05e-05, rel_err=1.59e-02
@@ -195,12 +209,13 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 03436065...: PASSED | 8.280 µs | 91.44x speedup | abs_err=1.30e-04, rel_err=1.47e-01
   Workload c40fb468...: PASSED | 8.295 µs | 91.00x speedup | abs_err=7.81e-03, rel_err=1.70e-02
 ```
+
 </details>
 
 <details>
-<summary>Run 2 (median 96.5x, 14.1 µs)</summary>
+<summary>Run 2: median 96.5x, 14.1 µs</summary>
 
-```
+```bash
 gdn_decode_qk4_v8_d128_k_last:
   Workload 6700a748...: PASSED | 14.104 µs | 106.52x speedup | abs_err=7.63e-05, rel_err=4.27e-02
   Workload d66ae544...: PASSED | 13.847 µs | 96.23x speedup | abs_err=3.05e-05, rel_err=1.45e-01
@@ -223,12 +238,13 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 03436065...: PASSED | 13.870 µs | 96.64x speedup | abs_err=1.56e-02, rel_err=1.52e-01
   Workload c40fb468...: PASSED | 17.996 µs | 69.76x speedup | abs_err=3.12e-02, rel_err=2.00e-02
 ```
+
 </details>
 
 <details>
-<summary>Run 3 (median 93.8x, 12.4 µs)</summary>
+<summary>Run 3: median 93.8x, 12.4 µs</summary>
 
-```
+```bash
 gdn_decode_qk4_v8_d128_k_last:
   Workload 6700a748...: PASSED | 12.410 µs | 95.15x speedup | abs_err=3.91e-03, rel_err=6.66e-02
   Workload d66ae544...: PASSED | 12.236 µs | 94.02x speedup | abs_err=3.43e-05, rel_err=3.14e-02
@@ -251,12 +267,109 @@ gdn_decode_qk4_v8_d128_k_last:
   Workload 03436065...: PASSED | 12.351 µs | 93.40x speedup | abs_err=9.77e-04, rel_err=1.87e-01
   Workload c40fb468...: PASSED | 12.589 µs | 92.69x speedup | abs_err=1.22e-04, rel_err=1.48e-01
 ```
+
 </details>
+<!-- markdownlint-enable MD033 -->
 
-Learnings on why v3 is better:
+### Why v3 Is Better
 
-v3 kernel issues a single warp and process 8 corresponding output rows.
+The v3 kernel issues a single warp and processes 8 corresponding output rows.
 
-1. 8 rows per block - each kernel is doing more work. Even though for v2 a single kernel needed to do less work, and occupancy was higher, v3 still wins because of the block size (32, 1). Each block has 1 warp working on 8 output rows.
-2. The major win is that per row, v3 kernel is doing less work. For eg: gate, beta calculations are done once per warp and used for all 8 rows. In v2 (block dims = (32, 8)), a single thread per row calculated it and broadcasted it within the warp.
-3. For 8 rows of the same head, q, k, gate scalars, indexing math, and reduction setup are mostly shared. v3 amortizes the invariant work.
+1. 8 rows per block means each kernel does more useful work. Even though
+   v2 had higher occupancy and less work per kernel, v3 still wins because
+   each `(32, 1)` block has 1 warp working on 8 output rows.
+2. The major win is that per row, the v3 kernel does less work. For
+   example, gate and beta calculations are done once per warp and reused
+   for all 8 rows. In v2 (`block dims = (32, 8)`), one thread per row
+   calculated them and broadcast them within the warp.
+3. For 8 rows of the same head, q, k, gate scalars, indexing math, and
+   reduction setup are mostly shared. v3 amortizes the invariant work.
+
+## Updated timings
+
+Parsed from Modal B200 CUPTI medians for
+`gdn_decode_qk4_v8_d128_k_last`.
+
+### Summary
+
+| Kernel | Workloads | Median of workload medians | Outright wins |
+|--------|-----------|----------------------------|---------------|
+| v2     | 53        | 7.58 us                    | 0             |
+| v3     | 53        | 5.44 us                    | 17            |
+| v4     | 53        | 5.47 us                    | 31            |
+
+| Kernel | Workloads | Median of workload medians | Outright wins |
+|--------|-----------|----------------------------|---------------|
+| v2     | 53        | 7.58 µs                    | 0             |
+| v3     | 53        | 5.44 µs                    | 17            |
+| v4     | 53        | 5.47 µs                    | 31            |
+
+### By workload range
+
+| Workload idx | v2 median | v3 median | v4 median |
+|--------------|-----------|-----------|-----------|
+| 1-10         | 3.20-3.23 us | 2.88 us | 2.53-2.56 us |
+| 11-18        | 4.03-4.06 us | 3.14 us | 3.07 us |
+| 19-25        | 5.15-5.18 us | 3.87 us | 3.90 us |
+| 26-32        | 7.58 us | 5.44-5.47 us | 5.47-5.50 us |
+| 33-39        | 12.19 us | 7.94 us | 7.87 us |
+| 40-46        | 16.83-16.86 us | 10.56-10.59 us | 10.53-10.56 us |
+| 47-53        | 21.54 us | 13.15 us | 13.15-13.18 us |
+
+### Per-workload medians
+
+| Workload | v2 | v3 | v4 | Best |
+|----------|----|----|----|------|
+| 1 | 3.23 us | 2.88 us | 2.53 us | v4 |
+| 2 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 3 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 4 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 5 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 6 | 3.23 us | 2.88 us | 2.56 us | v4 |
+| 7 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 8 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 9 | 3.23 us | 2.88 us | 2.56 us | v4 |
+| 10 | 3.20 us | 2.88 us | 2.56 us | v4 |
+| 11 | 4.03 us | 3.14 us | 3.07 us | v4 |
+| 12 | 4.06 us | 3.14 us | 3.07 us | v4 |
+| 13 | 4.06 us | 3.14 us | 3.07 us | v4 |
+| 14 | 4.06 us | 3.14 us | 3.07 us | v4 |
+| 15 | 4.03 us | 3.14 us | 3.07 us | v4 |
+| 16 | 4.03 us | 3.14 us | 3.07 us | v4 |
+| 17 | 4.06 us | 3.14 us | 3.07 us | v4 |
+| 18 | 4.03 us | 3.14 us | 3.07 us | v4 |
+| 19 | 5.15 us | 3.87 us | 3.90 us | v3 |
+| 20 | 5.18 us | 3.87 us | 3.90 us | v3 |
+| 21 | 5.18 us | 3.87 us | 3.90 us | v3 |
+| 22 | 5.15 us | 3.87 us | 3.90 us | v3 |
+| 23 | 5.15 us | 3.87 us | 3.90 us | v3 |
+| 24 | 5.15 us | 3.87 us | 3.90 us | v3 |
+| 25 | 5.18 us | 3.87 us | 3.90 us | v3 |
+| 26 | 7.58 us | 5.44 us | 5.47 us | v3 |
+| 27 | 7.58 us | 5.44 us | 5.47 us | v3 |
+| 28 | 7.58 us | 5.44 us | 5.47 us | v3 |
+| 29 | 7.58 us | 5.44 us | 5.50 us | v3 |
+| 30 | 7.58 us | 5.44 us | 5.47 us | v3 |
+| 31 | 7.58 us | 5.44 us | 5.47 us | v3 |
+| 32 | 7.58 us | 5.47 us | 5.50 us | v3 |
+| 33 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 34 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 35 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 36 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 37 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 38 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 39 | 12.19 us | 7.94 us | 7.87 us | v4 |
+| 40 | 16.86 us | 10.59 us | 10.53 us | v4 |
+| 41 | 16.83 us | 10.59 us | 10.53 us | v4 |
+| 42 | 16.86 us | 10.59 us | 10.56 us | v4 |
+| 43 | 16.86 us | 10.56 us | 10.53 us | v4 |
+| 44 | 16.83 us | 10.56 us | 10.53 us | v4 |
+| 45 | 16.83 us | 10.59 us | 10.53 us | v4 |
+| 46 | 16.83 us | 10.56 us | 10.56 us | v3 / v4 |
+| 47 | 21.54 us | 13.15 us | 13.15 us | v3 / v4 |
+| 48 | 21.54 us | 13.15 us | 13.15 us | v3 / v4 |
+| 49 | 21.54 us | 13.15 us | 13.18 us | v3 |
+| 50 | 21.54 us | 13.15 us | 13.15 us | v3 / v4 |
+| 51 | 21.54 us | 13.15 us | 13.18 us | v3 |
+| 52 | 21.54 us | 13.15 us | 13.15 us | v3 / v4 |
+| 53 | 21.54 us | 13.15 us | 13.18 us | v3 |

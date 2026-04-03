@@ -21,6 +21,17 @@
 #include <cmath>
 
 constexpr int kSplitV = 8;
+constexpr int kSmallVTileRows = 2;
+constexpr int kMediumVTileRows = 4;
+constexpr int kLargeVTileRows = 8;
+static constexpr int kWarpSize = 32;
+static constexpr int kHeadSize = 128;
+static constexpr int kNumQKHeads = 4;
+static constexpr int kNumVHeads = 8;
+static constexpr int kHeadGroupRatio = kNumVHeads / kNumQKHeads;
+static constexpr int kKVec = kHeadSize / kWarpSize;
+static constexpr int kVDim = 128;
+static constexpr float kScaleConst = 0.0883883476f;
 
 __device__ __forceinline__ float sigmoid(float x) {
     // Stable sigmoid
@@ -30,6 +41,22 @@ __device__ __forceinline__ float sigmoid(float x) {
     } else {
         float z = __expf(x);
         return z / (1.0f + z);
+    }
+}
+
+__device__ __forceinline__ void warp_reduce_2(float& a, float& b) {
+#pragma unroll
+    for (int off = kWarpSize / 2; off > 0; off >>= 1) {
+        float ta;
+        float tb;
+        asm volatile(
+            "shfl.sync.bfly.b32 %0, %2, %4, 0x1f, 0xffffffff;\n\t"
+            "shfl.sync.bfly.b32 %1, %3, %4, 0x1f, 0xffffffff;"
+            : "=f"(ta), "=f"(tb)
+            : "f"(a), "f"(b), "r"(off)
+        );
+        a += ta;
+        b += tb;
     }
 }
 
@@ -230,7 +257,8 @@ __global__ void gdn_v2(
     }
 }
 
-__global__ void gdn_v3(
+template <int BV>
+__global__ __launch_bounds__(kWarpSize, 1) void gdn_v3(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v,
@@ -248,109 +276,144 @@ __global__ void gdn_v3(
     int V,
     float scale
 ) {
-    int common_scalar_offset = num_v_heads*blockIdx.x + blockIdx.y;
-    int qk_head_factor = num_v_heads/num_k_heads;
+    const int i_v = blockIdx.x;
+    const int i_nh = blockIdx.y;
+    const int i_hv = i_nh % kNumVHeads;
+    const int i_h = i_hv / kHeadGroupRatio;
+    const int i_n = i_nh / kNumVHeads;
+    const int tid = threadIdx.x;
+    const int k_base = tid * kKVec;
+    const int state_base = i_nh * kVDim * kHeadSize;
 
-    int k_offset = (num_k_heads*blockIdx.x + blockIdx.y/qk_head_factor)*K;
-    int v_offset = common_scalar_offset*V;
-    int local_v = blockIdx.z*kSplitV + threadIdx.y;
-    // Get the read offset for state matrix (global)
-    // State matrix is BxHxVxK, we want VxK for every batch,head combination
-    int state_read = common_scalar_offset*V*K + local_v*K;
-
-    // Read state through the read-only path and stream write-back to avoid cache pollution.
-    int local_k = threadIdx.x*4;
-    const float4 s4 = __ldg(reinterpret_cast<const float4*>(&state[state_read+local_k]));
-
-    float v_in = 0.0f;
-    if (threadIdx.x == 0) {
-        v_in = __bfloat162float(v[v_offset + local_v]);
+    // Loading state - in float4 and for "BV" rows
+    float4 h4[BV];
+#pragma unroll
+    for (int row = 0; row < BV; ++row) {
+        const int v_idx = i_v * BV + row;
+        h4[row] = __ldg(reinterpret_cast<const float4*>(
+            state + state_base + v_idx * kHeadSize + k_base
+        ));
     }
 
-    uint32_t k_raw0;
-    uint32_t k_raw1;
-    asm volatile(
-        "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-        : "=r"(k_raw0), "=r"(k_raw1)
-        : "l"(k + k_offset + local_k)
-    );
-    __nv_bfloat162 k_pair01 = *reinterpret_cast<__nv_bfloat162*>(&k_raw0);
-    __nv_bfloat162 k_pair23 = *reinterpret_cast<__nv_bfloat162*>(&k_raw1);
-    float k0 = __bfloat162float(k_pair01.x);
-    float k1 = __bfloat162float(k_pair01.y);
-    float k2 = __bfloat162float(k_pair23.x);
-    float k3 = __bfloat162float(k_pair23.y);
-
-    uint32_t q_raw0;
-    uint32_t q_raw1;
-    asm volatile(
-        "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-        : "=r"(q_raw0), "=r"(q_raw1)
-        : "l"(q + k_offset + local_k)
-    );
-    __nv_bfloat162 q_pair01 = *reinterpret_cast<__nv_bfloat162*>(&q_raw0);
-    __nv_bfloat162 q_pair23 = *reinterpret_cast<__nv_bfloat162*>(&q_raw1);
-    float q0 = scale * __bfloat162float(q_pair01.x);
-    float q1 = scale * __bfloat162float(q_pair01.y);
-    float q2 = scale * __bfloat162float(q_pair23.x);
-    float q3 = scale * __bfloat162float(q_pair23.y);
-
-    float gate = 0.0f;
-    float beta = 0.0f;
-    if (threadIdx.x == 0) {
-        float x = __bfloat162float(a[common_scalar_offset]) + dt_bias[common_scalar_offset];
-        float sp = (x > 20.0f) ? x : __logf(1.0f + __expf(x));
-        gate = __expf(-__expf(A_log[common_scalar_offset]) * sp);
-        beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b[common_scalar_offset])));
-    }
-    gate = __shfl_sync(0xffffffff, gate, 0);
-    beta = __shfl_sync(0xffffffff, beta, 0);
-    float h0 = gate * s4.x;
-    float h1 = gate * s4.y;
-    float h2 = gate * s4.z;
-    float h3 = gate * s4.w;
-
-    float old_v_accum = 0.0f;
-    old_v_accum = fmaf(k0, h0, old_v_accum);
-    old_v_accum = fmaf(k1, h1, old_v_accum);
-    old_v_accum = fmaf(k2, h2, old_v_accum);
-    old_v_accum = fmaf(k3, h3, old_v_accum);
-
-# pragma unroll
-    // Warp reduction
-    for (int off = 16; off > 0; off >>= 1) {
-        old_v_accum += __shfl_down_sync(0xffffffff, old_v_accum, off);
+    // Flatenning into 2D layout (from float4)
+    float h[BV][kKVec];
+#pragma unroll
+    for (int row = 0; row < BV; ++row) {
+        h[row][0] = h4[row].x;
+        h[row][1] = h4[row].y;
+        h[row][2] = h4[row].z;
+        h[row][3] = h4[row].w;
     }
 
-    float old_v = __shfl_sync(0xffffffff, old_v_accum, 0);
-    float dv = 0.0f;
-    if (threadIdx.x == 0) {
-        dv = beta * (v_in - old_v);
-    }
-    dv = __shfl_sync(0xffffffff, dv, 0);
-
-    float valx = fmaf(dv, k0, h0);
-    float valy = fmaf(dv, k1, h1);
-    float valz = fmaf(dv, k2, h2);
-    float valw = fmaf(dv, k3, h3);
-
-    const float4 new_state_vec = make_float4(valx, valy, valz, valw);
-    __stcs(reinterpret_cast<float4*>(&new_state[state_read+local_k]), new_state_vec);
-
-    float out_acc = 0.0f;
-    out_acc = fmaf(q0, valx, out_acc);
-    out_acc = fmaf(q1, valy, out_acc);
-    out_acc = fmaf(q2, valz, out_acc);
-    out_acc = fmaf(q3, valw, out_acc);
-
-# pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        out_acc += __shfl_down_sync(0xffffffff, out_acc, off);
+    // Loading q/k rows - same for multiple rows of V
+    float q_reg[kKVec];
+    float k_reg[kKVec];
+    {
+        const int qk_offset = (i_n * kNumQKHeads + i_h) * kHeadSize + k_base;
+        const uint2 q_raw = __ldg(reinterpret_cast<const uint2*>(q + qk_offset));
+        const uint2 k_raw = __ldg(reinterpret_cast<const uint2*>(k + qk_offset));
+        __nv_bfloat162 q_pair01 = *reinterpret_cast<const __nv_bfloat162*>(&q_raw.x);
+        __nv_bfloat162 q_pair23 = *reinterpret_cast<const __nv_bfloat162*>(&q_raw.y);
+        __nv_bfloat162 k_pair01 = *reinterpret_cast<const __nv_bfloat162*>(&k_raw.x);
+        __nv_bfloat162 k_pair23 = *reinterpret_cast<const __nv_bfloat162*>(&k_raw.y);
+        q_reg[0] = __bfloat162float(q_pair01.x) * kScaleConst;
+        q_reg[1] = __bfloat162float(q_pair01.y) * kScaleConst;
+        q_reg[2] = __bfloat162float(q_pair23.x) * kScaleConst;
+        q_reg[3] = __bfloat162float(q_pair23.y) * kScaleConst;
+        k_reg[0] = __bfloat162float(k_pair01.x);
+        k_reg[1] = __bfloat162float(k_pair01.y);
+        k_reg[2] = __bfloat162float(k_pair23.x);
+        k_reg[3] = __bfloat162float(k_pair23.y);
     }
 
-    // Write out
-    if (threadIdx.x == 0) {
-        out[v_offset+local_v] = __float2bfloat16_rn(out_acc);
+    // Loading BV rows of V
+    float v_reg[BV];
+    {
+        const __nv_bfloat16* v_ptr = v + i_nh * kVDim + i_v * BV;
+        if constexpr (BV == 8) {
+            const uint4 v_raw = *reinterpret_cast<const uint4*>(v_ptr);
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.x);
+            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.y);
+            __nv_bfloat162 v45 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.z);
+            __nv_bfloat162 v67 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.w);
+            v_reg[0] = __bfloat162float(v01.x);
+            v_reg[1] = __bfloat162float(v01.y);
+            v_reg[2] = __bfloat162float(v23.x);
+            v_reg[3] = __bfloat162float(v23.y);
+            v_reg[4] = __bfloat162float(v45.x);
+            v_reg[5] = __bfloat162float(v45.y);
+            v_reg[6] = __bfloat162float(v67.x);
+            v_reg[7] = __bfloat162float(v67.y);
+        } else if constexpr (BV == 4) {
+            const uint2 v_raw = *reinterpret_cast<const uint2*>(v_ptr);
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.x);
+            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.y);
+            v_reg[0] = __bfloat162float(v01.x);
+            v_reg[1] = __bfloat162float(v01.y);
+            v_reg[2] = __bfloat162float(v23.x);
+            v_reg[3] = __bfloat162float(v23.y);
+        } else if constexpr (BV == 2) {
+            const uint32_t v_raw = *reinterpret_cast<const uint32_t*>(v_ptr);
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw);
+            v_reg[0] = __bfloat162float(v01.x);
+            v_reg[1] = __bfloat162float(v01.y);
+        }
+    }
+
+    // Computing scalars
+    const float gate_x = __bfloat162float(a[i_nh]) + dt_bias[i_hv];
+    const float gate = __expf(-__expf(A_log[i_hv]) * gate_x);
+    const float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b[i_nh])));
+
+    // State update
+#pragma unroll
+    for (int row = 0; row < BV; row += 2) {
+        float p0 = 0.0f;
+        float p1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKVec; ++i) {
+            h[row][i] *= gate;
+            h[row + 1][i] *= gate;
+            p0 = fmaf(k_reg[i], h[row][i], p0);
+            p1 = fmaf(k_reg[i], h[row + 1][i], p1);
+        }
+        warp_reduce_2(p0, p1);
+        const float dv0 = beta * (v_reg[row] - p0);
+        const float dv1 = beta * (v_reg[row + 1] - p1);
+#pragma unroll
+        for (int i = 0; i < kKVec; ++i) {
+            h[row][i] = fmaf(dv0, k_reg[i], h[row][i]);
+            h[row + 1][i] = fmaf(dv1, k_reg[i], h[row + 1][i]);
+        }
+    }
+
+    // Out computation and state store
+    __nv_bfloat16* out_ptr = out + i_nh * kVDim + i_v * BV;
+    float out_vals[BV];
+#pragma unroll
+    for (int row = 0; row < BV; row += 2) {
+        float p0 = 0.0f;
+        float p1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKVec; ++i) {
+            p0 = fmaf(q_reg[i], h[row][i], p0);
+            p1 = fmaf(q_reg[i], h[row + 1][i], p1);
+        }
+        warp_reduce_2(p0, p1);
+        out_vals[row] = p0;
+        out_vals[row + 1] = p1;
+
+        const int v_idx0 = i_v * BV + row;
+        const int v_idx1 = v_idx0 + 1;
+        const float4 new_state_vec0 = {h[row][0], h[row][1], h[row][2], h[row][3]};
+        const float4 new_state_vec1 = {h[row + 1][0], h[row + 1][1], h[row + 1][2], h[row + 1][3]};
+        __stcs(reinterpret_cast<float4*>(new_state + state_base + v_idx0 * kHeadSize + k_base), new_state_vec0);
+        __stcs(reinterpret_cast<float4*>(new_state + state_base + v_idx1 * kHeadSize + k_base), new_state_vec1);
+    }
+
+    // Out store
+    if (tid < BV) {
+        out_ptr[tid] = __float2bfloat16_rn(out_vals[tid]);
     }
 }
 
@@ -410,26 +473,68 @@ int main() {
     }
     for (size_t i = 0; i < out_elems; ++i) out[i] = __float2bfloat16_rn(0.0f);
 
-    dim3 threads_per_block(32, kSplitV);
-    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
-    gdn_v3<<<grid_size, threads_per_block, 0, nullptr>>>(
-        q,
-        k,
-        v,
-        state,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        out,
-        new_state,
-        B,
-        num_v_heads,
-        num_k_heads,
-        K,
-        V,
-        scale
-    );
+    dim3 threads_per_block(kWarpSize);
+    if (B == 1) {
+        dim3 grid_size(kVDim / kSmallVTileRows, B * kNumVHeads);
+        gdn_v3<kSmallVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            out,
+            new_state,
+            B,
+            num_v_heads,
+            num_k_heads,
+            K,
+            V,
+            scale
+        );
+    } else if (B <= 4) {
+        dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
+        gdn_v3<kMediumVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            out,
+            new_state,
+            B,
+            num_v_heads,
+            num_k_heads,
+            K,
+            V,
+            scale
+        );
+    } else {
+        dim3 grid_size(kVDim / kLargeVTileRows, B * kNumVHeads);
+        gdn_v3<kLargeVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            out,
+            new_state,
+            B,
+            num_v_heads,
+            num_k_heads,
+            K,
+            V,
+            scale
+        );
+    }
     const cudaError_t launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
         std::printf("launch_gdn failed: %s\n", cudaGetErrorString(launch_err));
@@ -475,26 +580,68 @@ void launch_gdn(
     const int V = static_cast<int>(v.size(3));
 
     const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
-    dim3 threads_per_block(32, kSplitV);
-    dim3 grid_size(B, num_v_heads, (V+kSplitV-1)/kSplitV);
-    gdn_v3<<<grid_size, threads_per_block, 0, stream.stream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
-        state.data_ptr<float>(),
-        A_log.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
-        dt_bias.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-        new_state.data_ptr<float>(),
-        B,
-        num_v_heads,
-        num_k_heads,
-        K,
-        V,
-        scale
-    );
+    dim3 threads_per_block(kWarpSize);
+    if (B == 1) {
+        dim3 grid_size(kVDim / kSmallVTileRows, B * kNumVHeads);
+        gdn_v3<kSmallVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
+            state.data_ptr<float>(),
+            A_log.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
+            dt_bias.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+            new_state.data_ptr<float>(),
+            B,
+            num_v_heads,
+            num_k_heads,
+            K,
+            V,
+            scale
+        );
+    } else if (B <= 4) {
+        dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
+        gdn_v3<kMediumVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
+            state.data_ptr<float>(),
+            A_log.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
+            dt_bias.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+            new_state.data_ptr<float>(),
+            B,
+            num_v_heads,
+            num_k_heads,
+            K,
+            V,
+            scale
+        );
+    } else {
+        dim3 grid_size(kVDim / kLargeVTileRows, B * kNumVHeads);
+        gdn_v3<kLargeVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
+            state.data_ptr<float>(),
+            A_log.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
+            dt_bias.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+            new_state.data_ptr<float>(),
+            B,
+            num_v_heads,
+            num_k_heads,
+            K,
+            V,
+            scale
+        );
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

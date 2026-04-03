@@ -10,8 +10,14 @@ WORKLOAD_IDX ?= 0
 
 .DEFAULT_GOAL := profile
 
-.PHONY: profile bench-local bench-modal timing-local timing-modal
+.PHONY: profile profile-ui bench-local bench-modal timing-local timing-modal
+
 profile:
+	mkdir -p "$(OUT_DIR)"
+	$(NCU) -o "$(OUT_DIR)/$(OUTPUT)" $(PYTHON) scripts/profile_local.py --input "$(INPUT)"
+	@echo 'Saved the profile: $(OUT_DIR)/$(OUTPUT)'
+
+profile-ui:
 	mkdir -p "$(OUT_DIR)"
 	$(NCU) -o "$(OUT_DIR)/$(OUTPUT)" $(PYTHON) scripts/profile_local.py --input "$(INPUT)"
 	@echo 'Opening $(REPORT) in Nsight Compute UI'
@@ -24,7 +30,7 @@ bench-modal:
 	$(MODAL) run scripts/run_modal.py
 
 timing-local:
-	$(PYTHON) scripts/bench_fi_timing.py --workload-idx "$(WORKLOAD_IDX)"
+	$(PYTHON) scripts/bench_fi_timing.py --workload-idx $(WORKLOAD_IDX)
 
 timing-modal:
-	$(MODAL) run scripts/bench_fi_timing_modal.py --workload-idx "$(WORKLOAD_IDX)"
+	$(MODAL) run scripts/bench_fi_timing_modal.py --workload-idx $(WORKLOAD_IDX)

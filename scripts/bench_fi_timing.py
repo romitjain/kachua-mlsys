@@ -289,13 +289,14 @@ def run_benchmark(
         "workload_idx": workload_idx,
         "timing_backend": timing_backend,
         "median_us": statistics.median(times_us),
+        "mean_us": statistics.mean(times_us),
         "min_us": min(times_us),
         "max_us": max(times_us),
         "iters": len(times_us),
     }
 
     print(
-        f"{solution_name} [{timing_backend}]: median={result['median_us']:.2f} us "
+        f"{solution_name} [{timing_backend}]: mean={result['mean_us']:.2f} median={result['median_us']:.2f} us "
         f"(min={result['min_us']:.2f} us, max={result['max_us']:.2f} us, n={result['iters']})"
     )
     return result

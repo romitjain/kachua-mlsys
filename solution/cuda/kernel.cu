@@ -362,46 +362,39 @@ __global__ __launch_bounds__(kWarpSize, 1) void gdn_v3(
 
     // Computing scalars
     const float gate_x = __bfloat162float(a[i_nh]) + dt_bias[i_hv];
-    const float gate = __expf(-__expf(A_log[i_hv]) * gate_x);
+    const float gate_sp = __logf(1.0f + __expf(gate_x));
+    const float gate = __expf(-__expf(A_log[i_hv]) * gate_sp);
     const float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b[i_nh])));
 
-    // State update
-#pragma unroll
-    for (int row = 0; row < BV; row += 2) {
-        float p0 = 0.0f;
-        float p1 = 0.0f;
-#pragma unroll
-        for (int i = 0; i < kKVec; ++i) {
-            h[row][i] *= gate;
-            h[row + 1][i] *= gate;
-            p0 = fmaf(k_reg[i], h[row][i], p0);
-            p1 = fmaf(k_reg[i], h[row + 1][i], p1);
-        }
-        warp_reduce_2(p0, p1);
-        const float dv0 = beta * (v_reg[row] - p0);
-        const float dv1 = beta * (v_reg[row + 1] - p1);
-#pragma unroll
-        for (int i = 0; i < kKVec; ++i) {
-            h[row][i] = fmaf(dv0, k_reg[i], h[row][i]);
-            h[row + 1][i] = fmaf(dv1, k_reg[i], h[row + 1][i]);
-        }
-    }
-
-    // Out computation and state store
+    // Fused state update + out computation + state store
     __nv_bfloat16* out_ptr = out + i_nh * kVDim + i_v * BV;
     float out_vals[BV];
 #pragma unroll
     for (int row = 0; row < BV; row += 2) {
-        float p0 = 0.0f;
-        float p1 = 0.0f;
+        float old_v0 = 0.0f;
+        float old_v1 = 0.0f;
 #pragma unroll
         for (int i = 0; i < kKVec; ++i) {
-            p0 = fmaf(q_reg[i], h[row][i], p0);
-            p1 = fmaf(q_reg[i], h[row + 1][i], p1);
+            h[row][i] *= gate;
+            h[row + 1][i] *= gate;
+            old_v0 = fmaf(k_reg[i], h[row][i], old_v0);
+            old_v1 = fmaf(k_reg[i], h[row + 1][i], old_v1);
         }
-        warp_reduce_2(p0, p1);
-        out_vals[row] = p0;
-        out_vals[row + 1] = p1;
+        warp_reduce_2(old_v0, old_v1);
+        const float dv0 = beta * (v_reg[row] - old_v0);
+        const float dv1 = beta * (v_reg[row + 1] - old_v1);
+        float out0 = 0.0f;
+        float out1 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKVec; ++i) {
+            h[row][i] = fmaf(dv0, k_reg[i], h[row][i]);
+            h[row + 1][i] = fmaf(dv1, k_reg[i], h[row + 1][i]);
+            out0 = fmaf(q_reg[i], h[row][i], out0);
+            out1 = fmaf(q_reg[i], h[row + 1][i], out1);
+        }
+        warp_reduce_2(out0, out1);
+        out_vals[row] = out0;
+        out_vals[row + 1] = out1;
 
         const int v_idx0 = i_v * BV + row;
         const int v_idx1 = v_idx0 + 1;

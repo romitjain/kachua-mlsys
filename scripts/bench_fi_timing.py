@@ -246,14 +246,6 @@ def run_benchmark(
     )
     call_args = tuple(tensors[name] for name in input_names)
 
-    print(f"Solution: {solution_name}")
-    print(f"Definition: {definition_name}")
-    print(f"Workload index: {workload_idx}")
-    if device.startswith("cuda"):
-        print(f"Device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
-    else:
-        print(f"Device: {device}")
-
     kernel(*call_args)
     torch.cuda.synchronize()
 
@@ -295,6 +287,9 @@ def run_benchmark(
         "iters": len(times_us),
     }
 
+    print(f"Workload index: {workload_idx}")
+    print(f"Solution: {solution_name}")
+    print(f"Definition: {definition_name}")
     print(
         f"{solution_name} [{timing_backend}]: mean={result['mean_us']:.2f} median={result['median_us']:.2f} us "
         f"(min={result['min_us']:.2f} us, max={result['max_us']:.2f} us, n={result['iters']})"

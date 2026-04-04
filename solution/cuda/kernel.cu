@@ -1,12 +1,3 @@
-/*
- * CUDA Kernel Template for FlashInfer Competition.
- *
- * Implement your kernel logic here. The entry point function name should match
- * the `entry_point` setting in config.toml.
- *
- * See the track definition for required function signature and semantics.
- */
-
 //  Launch command
 // nvcc -std=c++17 -Wno-deprecated-gpu-targets -o kernel.o kernel.cu
 
@@ -682,6 +673,8 @@ int main() {
 
 #ifdef TORCH_EXTENSION_NAME
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <torch/extension.h>
 
 void launch_gdn(
@@ -771,4 +764,3 @@ void launch_gdn(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("launch_gdn", &launch_gdn, "Launch gdn CUDA kernel");
 }
-#endif  // TORCH_EXTENSION_NAME

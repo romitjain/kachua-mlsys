@@ -287,6 +287,7 @@ def run_benchmark(
         "iters": len(times_us),
     }
 
+    print("===" * 10)
     print(f"Workload index: {workload_idx}")
     print(f"Solution: {solution_name}")
     print(f"Definition: {definition_name}")

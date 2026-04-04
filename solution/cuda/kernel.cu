@@ -285,24 +285,19 @@ __global__ __launch_bounds__(kWarpSize, 1) void gdn_v3(
     const int k_base = tid * kKVec;
     const int state_base = i_nh * kVDim * kHeadSize;
 
-    // Loading state - in float4 and for "BV" rows
-    float4 h4[BV];
-#pragma unroll
-    for (int row = 0; row < BV; ++row) {
-        const int v_idx = i_v * BV + row;
-        h4[row] = __ldg(reinterpret_cast<const float4*>(
-            state + state_base + v_idx * kHeadSize + k_base
-        ));
-    }
-
-    // Flatenning into 2D layout (from float4)
+    // Loading state - in 2D foramt (rows, 4)
+    // We do float4 loads we get 4 individual values.
+    // Done for the complete warp, we get 4*32 = 128 vals (head dim)
     float h[BV][kKVec];
 #pragma unroll
     for (int row = 0; row < BV; ++row) {
-        h[row][0] = h4[row].x;
-        h[row][1] = h4[row].y;
-        h[row][2] = h4[row].z;
-        h[row][3] = h4[row].w;
+        const int v_idx = i_v * BV + row;
+        const float* state_ptr = state + state_base + v_idx * kHeadSize + k_base;
+        const float4 h_vec = __ldg(reinterpret_cast<const float4*>(state_ptr));
+        h[row][0] = h_vec.x;
+        h[row][1] = h_vec.y;
+        h[row][2] = h_vec.z;
+        h[row][3] = h_vec.w;
     }
 
     // Loading q/k rows - same for multiple rows of V
@@ -508,8 +503,8 @@ int main() {
             scale
         );
     } else {
-        dim3 grid_size(kVDim / kLargeVTileRows, B * kNumVHeads);
-        gdn_v3<kLargeVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+        dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
+        gdn_v3<kMediumVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
             q,
             k,
             v,
@@ -615,8 +610,8 @@ void launch_gdn(
             scale
         );
     } else {
-        dim3 grid_size(kVDim / kLargeVTileRows, B * kNumVHeads);
-        gdn_v3<kLargeVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
+        dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
+        gdn_v3<kMediumVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),

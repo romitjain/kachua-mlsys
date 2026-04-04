@@ -373,3 +373,27 @@ Parsed from Modal B200 CUPTI medians for
 | 52 | 21.54 us | 13.15 us | 13.18 us | v3 |
 | 53 | 21.54 us | 13.15 us | 13.15 us | v3 / v4 |
 | 54 | 21.54 us | 13.15 us | 13.18 us | v3 |
+
+## v5 Kernel (Claude session, BV=8 + scalar preloading)
+
+### Changes from v4
+
+1. **BV=8 path for B>=3** (`if constexpr (BV == 8)`): Processes all 8 rows together with 8 independent accumulators. Eliminates RAW stalls (31 FMAs between same-row write and read) and serial FMA chain stalls. Uses `warp_reduce_4` PTX inline asm to batch 4 shuffles per round.
+
+2. **BV dispatch**: B=1→BV=2, B=2→BV=4, B>=3→BV=8 (changed from B<=4→BV=4 in v4).
+
+3. **Softplus gate computation** (correctness fix): v4 used `gate_x` directly; reference uses `softplus(gate_x) = log(1+exp(gate_x))`.
+
+4. **Scalar preloading**: All 4 gate scalars (A_log, a, dt_bias, b) loaded before state loads. Three independent `__expf` chains started early (`neg_exp_A`, `exp_gate_x`, `exp_neg_b`), overlapping ~300 cycles of SFU latency with state load latency.
+
+### Results (2 confirmed Modal B200 runs, medians)
+
+| Workload range | B | v4 median | v5 median | Delta |
+|----------------|---|-----------|-----------|-------|
+| 1-10  | 1 | 2.53-2.56 µs | 2.53 µs | ~0 (softplus overhead hidden) |
+| 11-18 | 2 | 3.07 µs      | 3.14 µs | +0.07 µs (softplus correctness cost) |
+| 19-25 | 3 | 3.90 µs      | 3.84 µs | **-0.06 µs** |
+| 26-32 | 4 | 5.47-5.50 µs | 5.41 µs | **-0.06–0.09 µs** |
+| 33-39 | 5 | 7.87 µs      | 7.68-7.71 µs | **-0.16–0.19 µs** |
+| 40-46 | 6 | 10.53 µs     | 10.30 µs | **-0.23 µs** |
+| 47-54 | 7+| 13.15 µs    | 12.99 µs | **-0.16 µs** |

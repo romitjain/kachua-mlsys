@@ -764,3 +764,4 @@ void launch_gdn(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("launch_gdn", &launch_gdn, "Launch gdn CUDA kernel");
 }
+#endif

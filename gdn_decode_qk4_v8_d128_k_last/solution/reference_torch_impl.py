@@ -12,13 +12,13 @@ def matmul(a: torch.Tensor, b: torch.Tensor):
 def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     """
     Gated Delta Net decode reference implementation (k-last layout).
-
+    
     State layout: [B, H, V, K] (k-last, K dimension at the end)
-
+    
     Gate computation:
     g = exp(-exp(A_log) * softplus(a + dt_bias))
     beta = sigmoid(b)
-
+    
     Delta rule update:
     state_new = g * state_old + k^T @ (beta * v + (1-beta) * k @ state_old) - k^T @ (k @ state_old)
     output = scale * q @ state_new
@@ -36,7 +36,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     x = a.float() + dt_bias.float()  # [B, 1, HV]
     g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [B, 1, HV]
     beta = torch.sigmoid(b.float())  # [B, 1, HV]
-
+    
     q_f32 = q.squeeze(1).float()
     k_f32 = k.squeeze(1).float()
     v_f32 = v.squeeze(1).float()
@@ -45,7 +45,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
 
     q_exp = q_f32.repeat_interleave(num_v_heads // num_q_heads, dim=1)
     k_exp = k_f32.repeat_interleave(num_v_heads // num_k_heads, dim=1)
-
+    
     new_state = torch.empty_like(state)
     output = torch.empty(B, num_heads, V, dtype=torch.float32, device=device)
     
@@ -57,14 +57,14 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
             h_state = state[b_idx, h_idx].clone().transpose(-1, -2)  # [V,K] -> [K,V]
             g_val = g_f32[b_idx, h_idx]
             beta_val = beta_f32[b_idx, h_idx]
-
+            
             old_state = g_val * h_state
             old_v = k_h @ old_state
             new_v = beta_val * v_h + (1 - beta_val) * old_v
             state_remove = k_h.unsqueeze(1) @ old_v.unsqueeze(0)
             state_update = k_h.unsqueeze(1) @ new_v.unsqueeze(0)
             h_state = old_state - state_remove + state_update
-
+            
             output[b_idx, h_idx] = scale * (q_h @ h_state)
             new_state[b_idx, h_idx] = h_state.transpose(-1, -2)  # [K,V] -> [V,K]
 

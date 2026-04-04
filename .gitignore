@@ -227,3 +227,5 @@ profiles/
 results/
 AGENTS.md
 CLAUDE.md
+
+ncu_profiles/*

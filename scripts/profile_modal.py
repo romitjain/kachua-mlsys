@@ -45,7 +45,7 @@ def resolve_profile_target() -> ProfileTarget:
     language = build["language"]
 
     if language == "cuda":
-        kernel_regex = "regex:.*gdn_decode_kernel.*"
+        kernel_regex = "regex:^gdn_.*"
         binding = build.get("binding")
         source_files = [f"solution/cuda/{entry_file}", "solution/cuda/binding.py"]
         return ProfileTarget(

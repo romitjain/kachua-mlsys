@@ -1,190 +1,123 @@
-"""Profile the active config.toml kernel on Modal with Nsight Compute."""
+"""Profile workspace kernels on Modal with Nsight Compute using synthetic inputs."""
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if TYPE_CHECKING:
+    from scripts.workspace_utils import BuildTarget, WorkspaceLayout
+
+
 REMOTE_WORKSPACE = Path("/workspace")
-LOCAL_PROFILE_ROOT = PROJECT_ROOT / "profiles"
 PROFILE_VOLUME_NAME = "kachua-gdn-profiles"
-
-
-@dataclass(frozen=True)
-class ProfileShape:
-    """Describe the synthetic shape used for one profiling run."""
-
-    batch_size: int
-    total_seq_len: int
-    num_seqs: int
-    cu_seqlens_len: int
+MODAL_CLI = [sys.executable, "-m", "modal"]
 
 
 @dataclass(frozen=True)
 class ProfileTarget:
-    """Describe the implementation selected by config.toml."""
+    """Describe one workspace implementation selected for profiling."""
 
-    backend: str
-    problem_kind: str
-    entry_file: str
-    entry_function: str
+    build_target: BuildTarget
     runner_function: str
     ncu_kernel_regex: str
     source_files: tuple[str, ...]
-    binding: str | None = None
+
+    @property
+    def backend(self) -> str:
+        return self.build_target.backend
+
+    @property
+    def workspace(self) -> WorkspaceLayout:
+        return self.build_target.workspace
+
+    @property
+    def problem_kind(self) -> str:
+        return self.build_target.problem_kind
+
+    @property
+    def entry_file(self) -> str:
+        return self.build_target.entry_file
+
+    @property
+    def entry_function(self) -> str:
+        return self.build_target.entry_function
+
+    @property
+    def binding(self) -> str | None:
+        return self.build_target.binding
 
 
-def load_config() -> dict:
-    """Load the repository config.toml."""
-    with open(PROJECT_ROOT / "config.toml", "rb") as config_file:
-        return tomllib.load(config_file)
-
-
-def resolve_problem_kind(definition_name: str) -> str:
-    """Resolve whether the active definition is decode or prefill."""
-    if "_decode_" in definition_name:
-        return "decode"
-    if "_prefill_" in definition_name:
-        return "prefill"
-    raise ValueError(
-        f"Unsupported definition '{definition_name}'. Expected a decode or prefill definition."
-    )
-
-
-def kernel_regex_for_problem(problem_kind: str) -> str:
-    """Return the Nsight Compute kernel-name regex for the selected problem."""
-    if problem_kind == "decode":
-        return "regex:.*gdn_decode_kernel.*"
-    if problem_kind == "prefill":
-        return "regex:.*gdn_prefill_kernel.*"
-    raise ValueError(f"Unsupported problem kind: {problem_kind}")
-
-
-def resolve_profile_target() -> ProfileTarget:
-    """Resolve the active config.toml entry to a profile target."""
-    config = load_config()
-    build = config["build"]
-    definition_name = config["solution"]["definition"]
-    entry_file, entry_function = build["entry_point"].split("::", maxsplit=1)
-    language = build["language"]
-    problem_kind = resolve_problem_kind(definition_name)
-    kernel_regex = kernel_regex_for_problem(problem_kind)
-
-    if language == "cuda":
-        binding = build.get("binding")
-        return ProfileTarget(
-            backend="cuda",
-            problem_kind=problem_kind,
-            entry_file=entry_file,
-            entry_function=entry_function,
-            runner_function="kernel" if binding == "torch" else entry_function,
-            ncu_kernel_regex=kernel_regex,
-            source_files=(f"solution/cuda/{entry_file}", "solution/cuda/binding.py"),
-            binding=binding,
-        )
-
-    if language == "triton":
-        return ProfileTarget(
-            backend="triton",
-            problem_kind=problem_kind,
-            entry_file=entry_file,
-            entry_function=entry_function,
-            runner_function=entry_function,
-            ncu_kernel_regex=kernel_regex,
-            source_files=(f"solution/triton/{entry_file}",),
-        )
-
-    if language == "cute":
-        return ProfileTarget(
-            backend="cute",
-            problem_kind=problem_kind,
-            entry_file=entry_file,
-            entry_function=entry_function,
-            runner_function=entry_function,
-            ncu_kernel_regex=kernel_regex,
-            source_files=(f"solution/cute/{entry_file}",),
-        )
-
-    raise ValueError(f"Unsupported language in config.toml: {language}")
-
-
-def require_positive(name: str, value: int) -> None:
-    """Require a positive integer CLI argument."""
-    if value < 1:
-        raise ValueError(f"{name} must be >= 1, got {value}")
-
-
-def resolve_cu_seqlens_len(num_seqs: int, cu_seqlens_len: int) -> int:
-    """Resolve and validate the prefill cu_seqlens length."""
-    expected = num_seqs + 1
-    if cu_seqlens_len <= 0:
-        return expected
-    if cu_seqlens_len != expected:
-        raise ValueError(
-            "cu_seqlens_len must equal num_seqs + 1 for packed prefill inputs. "
-            f"Expected {expected}, got {cu_seqlens_len}."
-        )
-    return cu_seqlens_len
-
-
-def build_profile_shape(
-    target: ProfileTarget,
-    batch_size: int,
-    total_seq_len: int,
-    num_seqs: int,
-    cu_seqlens_len: int,
-) -> ProfileShape:
-    """Build the synthetic shape for the selected decode or prefill target."""
+def kernel_regex_for_target(target: BuildTarget) -> str:
+    """Return the Nsight Compute kernel-name regex for the selected target."""
     if target.problem_kind == "decode":
-        require_positive("batch_size", batch_size)
-        return ProfileShape(
-            batch_size=batch_size,
-            total_seq_len=total_seq_len,
-            num_seqs=num_seqs,
-            cu_seqlens_len=resolve_cu_seqlens_len(num_seqs, cu_seqlens_len),
+        return r"regex:.*gdn_v[0-9]+.*"
+    if target.problem_kind == "prefill":
+        return r"regex:.*gdn_prefill_kernel.*"
+    raise ValueError(f"Unsupported problem kind: {target.problem_kind}")
+
+
+def resolve_profile_target(workspace: WorkspaceLayout) -> ProfileTarget:
+    """Resolve one workspace config to a profile target."""
+    from scripts.workspace_utils import resolve_build_target
+
+    target = resolve_build_target(workspace)
+    kernel_regex = kernel_regex_for_target(target)
+
+    if target.language == "cuda":
+        source_files = (
+            f"solution/cuda/{target.entry_file}",
+            "solution/cuda/binding.py",
+        )
+        runner_function = (
+            "kernel" if target.binding == "torch" else target.entry_function
+        )
+        return ProfileTarget(
+            build_target=target,
+            runner_function=runner_function,
+            ncu_kernel_regex=kernel_regex,
+            source_files=source_files,
         )
 
-    require_positive("total_seq_len", total_seq_len)
-    require_positive("num_seqs", num_seqs)
-    return ProfileShape(
-        batch_size=batch_size,
-        total_seq_len=total_seq_len,
-        num_seqs=num_seqs,
-        cu_seqlens_len=resolve_cu_seqlens_len(num_seqs, cu_seqlens_len),
-    )
+    if target.language == "triton":
+        return ProfileTarget(
+            build_target=target,
+            runner_function=target.entry_function,
+            ncu_kernel_regex=kernel_regex,
+            source_files=(f"solution/triton/{target.entry_file}",),
+        )
 
+    if target.language == "cute":
+        return ProfileTarget(
+            build_target=target,
+            runner_function=target.entry_function,
+            ncu_kernel_regex=kernel_regex,
+            source_files=(f"solution/cute/{target.entry_file}",),
+        )
 
-def format_run_id(target: ProfileTarget, shape: ProfileShape, timestamp: str) -> str:
-    """Format a readable run id for one profiling invocation."""
-    if target.problem_kind == "decode":
-        return f"{timestamp}_b{shape.batch_size}"
-    return (
-        f"{timestamp}_t{shape.total_seq_len}"
-        f"_n{shape.num_seqs}"
-        f"_c{shape.cu_seqlens_len}"
-    )
+    raise ValueError(f"Unsupported language in config.toml: {target.language}")
 
 
 def read_profile_sources(target: ProfileTarget) -> dict[str, str]:
     """Load only the files needed by the active target."""
-    sources: dict[str, str] = {"config.toml": (PROJECT_ROOT / "config.toml").read_text()}
-    for relative_path in target.source_files:
-        sources[relative_path] = (PROJECT_ROOT / relative_path).read_text()
+    from scripts.workspace_utils import read_workspace_sources
+
+    sources = read_workspace_sources(target.workspace, ("config.toml",))
+    sources.update(read_workspace_sources(target.workspace, target.source_files))
     return sources
 
 
 def build_runner_source(
     target: ProfileTarget,
-    shape: ProfileShape,
+    shape,
     warmup: int,
     seed: int,
 ) -> str:
@@ -334,13 +267,13 @@ stub_tvm_ffi.register_global_func = lambda _name: (lambda function: function)
 sys.modules["tvm_ffi"] = stub_tvm_ffi
 
 
-torch.manual_seed(SEED)
 device = "cuda"
 K_DIM = 128
 V_DIM = 128
 NUM_Q_HEADS = 4
 NUM_K_HEADS = 4
 NUM_V_HEADS = 8
+torch.manual_seed(SEED)
 scale = 1.0 / (K_DIM ** 0.5)
 
 if PROBLEM_KIND == "decode":
@@ -459,7 +392,7 @@ torch.cuda.synchronize()
 invoke()
 torch.cuda.synchronize()
 """
-    elif target.backend in ("triton", "cute"):
+    else:
         backend_dir = "triton" if target.backend == "triton" else "cute"
         body = f"""
 kernel_module = load_module(
@@ -500,8 +433,6 @@ torch.cuda.synchronize()
 invoke()
 torch.cuda.synchronize()
 """
-    else:
-        body = f'raise ValueError("Unsupported backend for profiling: {target.backend}")\n'
 
     prelude = textwrap.dedent(
         f"""
@@ -530,7 +461,7 @@ def to_volume_path(remote_path: str) -> str:
 
 try:
     import modal
-except ModuleNotFoundError:
+except ModuleNotFoundError:  # pragma: no cover
     modal = None
 
 
@@ -539,7 +470,9 @@ if modal is not None:
     profile_volume = modal.Volume.from_name(PROFILE_VOLUME_NAME, create_if_missing=True)
     profile_dir = Path("/profiles")
     image = (
-        modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
+        modal.Image.from_registry(
+            "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12"
+        )
         .uv_pip_install(
             "apache-tvm-ffi",
             "flashinfer-bench",
@@ -612,7 +545,8 @@ if modal is not None:
             return metrics
 
         def pick_metric(
-            metrics: dict[str, dict[str, str]], names: tuple[str, ...]
+            metrics: dict[str, dict[str, str]],
+            names: tuple[str, ...],
         ) -> dict[str, str] | None:
             for name in names:
                 if name in metrics:
@@ -625,7 +559,8 @@ if modal is not None:
                 "launch__grid_size": pick_metric(metrics, ("launch__grid_size",)),
                 "launch__block_size": pick_metric(metrics, ("launch__block_size",)),
                 "launch__registers_per_thread": pick_metric(
-                    metrics, ("launch__registers_per_thread",)
+                    metrics,
+                    ("launch__registers_per_thread",),
                 ),
                 "gpu__time_duration.sum": pick_metric(
                     metrics, ("gpu__time_duration.sum",)
@@ -652,7 +587,8 @@ if modal is not None:
                     ),
                 ),
                 "achieved_occupancy": pick_metric(
-                    metrics, ("sm__warps_active.avg.pct_of_peak_sustained_active",)
+                    metrics,
+                    ("sm__warps_active.avg.pct_of_peak_sustained_active",),
                 ),
             }
 
@@ -673,19 +609,23 @@ if modal is not None:
                     }
                 )
 
-            stall_metrics.sort(key=lambda item: float(item["numeric_value"]), reverse=True)
+            stall_metrics.sort(
+                key=lambda item: float(item["numeric_value"]), reverse=True
+            )
             summary["top_stall_metrics"] = stall_metrics[:10]
             return summary
 
         for relative_path, content in source_files.items():
-            out_path = REMOTE_WORKSPACE / relative_path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(content)
+            output_path = REMOTE_WORKSPACE / relative_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(content)
 
         runner_path = REMOTE_WORKSPACE / "runner.py"
         runner_path.write_text(runner_source)
 
-        target_dir = profile_dir / target["backend"] / Path(target["entry_file"]).stem / run_id
+        target_dir = (
+            profile_dir / target["backend"] / Path(target["entry_file"]).stem / run_id
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         report_stem = target_dir / "profile"
 
@@ -720,21 +660,13 @@ if modal is not None:
         raw_csv_path = report_stem.with_suffix(".raw.csv")
         details_path = report_stem.with_suffix(".details.txt")
         summary_path = report_stem.with_suffix(".summary.json")
-
         raw_csv_stdout = ""
         details_stdout = ""
         summary_json = ""
         extraction_stderr = ""
 
         if result.returncode == 0:
-            raw_command = [
-                ncu,
-                "--import",
-                str(report_path),
-                "--page",
-                "raw",
-                "--csv",
-            ]
+            raw_command = [ncu, "--import", str(report_path), "--page", "raw", "--csv"]
             raw_result = subprocess.run(
                 raw_command,
                 capture_output=True,
@@ -746,13 +678,7 @@ if modal is not None:
             extraction_stderr += raw_result.stderr
             raw_csv_path.write_text(raw_csv_stdout)
 
-            details_command = [
-                ncu,
-                "--import",
-                str(report_path),
-                "--page",
-                "details",
-            ]
+            details_command = [ncu, "--import", str(report_path), "--page", "details"]
             details_result = subprocess.run(
                 details_command,
                 capture_output=True,
@@ -786,52 +712,19 @@ if modal is not None:
             "extraction_stderr": extraction_stderr,
         }
 
-    @app.local_entrypoint()
-    def main(
-        batch_size: int = 1,
-        total_seq_len: int = 128,
-        num_seqs: int = 4,
-        cu_seqlens_len: int = 0,
-        warmup: int = 5,
-        seed: int = 7,
-        ncu_set: str = "basic",
-    ) -> None:
-        from datetime import datetime
-
-        target = resolve_profile_target()
-        shape = build_profile_shape(
-            target=target,
-            batch_size=batch_size,
-            total_seq_len=total_seq_len,
-            num_seqs=num_seqs,
-            cu_seqlens_len=cu_seqlens_len,
+    def download_profile_artifacts(
+        workspace_layout: WorkspaceLayout,
+        target: ProfileTarget,
+        run_id: str,
+        result: dict[str, str | int],
+    ) -> tuple[list[Path], bool]:
+        local_target_dir = (
+            workspace_layout.profiles_dir
+            / target.backend
+            / Path(target.entry_file).stem
+            / run_id
         )
-        run_id = format_run_id(target, shape, f"{datetime.now():%Y%m%d_%H%M%S}")
-
-        result = run_profile.remote(
-            target_json=json.dumps(
-                {
-                    "backend": target.backend,
-                    "entry_file": target.entry_file,
-                    "ncu_kernel_regex": target.ncu_kernel_regex,
-                }
-            ),
-            source_files=read_profile_sources(target),
-            runner_source=build_runner_source(
-                target=target,
-                shape=shape,
-                warmup=warmup,
-                seed=seed,
-            ),
-            ncu_set=ncu_set,
-            warmup=warmup,
-            run_id=run_id,
-        )
-
-        stem = Path(target.entry_file).stem
-        local_target_dir = LOCAL_PROFILE_ROOT / target.backend / stem / run_id
         local_target_dir.mkdir(parents=True, exist_ok=True)
-
         remote_paths = [
             result["report_path"],
             result.get("raw_csv_path"),
@@ -848,9 +741,7 @@ if modal is not None:
             local_path = local_target_dir / Path(str(remote_path)).name
             download = subprocess.run(
                 [
-                    "uv",
-                    "run",
-                    "modal",
+                    *MODAL_CLI,
                     "volume",
                     "get",
                     "--force",
@@ -860,7 +751,7 @@ if modal is not None:
                 ],
                 capture_output=True,
                 text=True,
-                cwd=str(PROJECT_ROOT),
+                cwd=str(REPO_ROOT),
             )
             if download.returncode != 0:
                 download_failed = True
@@ -879,9 +770,7 @@ if modal is not None:
                 volume_path = to_volume_path(str(remote_path))
                 cleanup = subprocess.run(
                     [
-                        "uv",
-                        "run",
-                        "modal",
+                        *MODAL_CLI,
                         "volume",
                         "rm",
                         PROFILE_VOLUME_NAME,
@@ -889,25 +778,34 @@ if modal is not None:
                     ],
                     capture_output=True,
                     text=True,
-                    cwd=str(PROJECT_ROOT),
+                    cwd=str(REPO_ROOT),
                 )
                 if cleanup.returncode != 0 and cleanup.stderr:
                     print(cleanup.stderr)
 
+        return downloaded_paths, download_failed
+
+    def print_profile_result(
+        workspace_layout: WorkspaceLayout,
+        target: ProfileTarget,
+        shape,
+        result: dict[str, str | int],
+        downloaded_paths: list[Path],
+        download_failed: bool,
+    ) -> None:
         shape_summary = (
             f"batch_size={shape.batch_size}"
             if target.problem_kind == "decode"
             else (
-                "total_seq_len="
-                f"{shape.total_seq_len}, num_seqs={shape.num_seqs}, "
+                f"total_seq_len={shape.total_seq_len}, "
+                f"num_seqs={shape.num_seqs}, "
                 f"cu_seqlens_len={shape.cu_seqlens_len}"
             )
         )
-
         print(
-            "Profiled "
-            f"{target.backend} {target.problem_kind} from config entry "
-            f"{target.entry_file}::{target.entry_function}"
+            f"Profiled workspace {workspace_layout.name}: "
+            f"{target.backend} {target.problem_kind} "
+            f"from {target.entry_file}::{target.entry_function}"
         )
         print(f"shape: {shape_summary}")
         print(f"ncu exit code: {result['exit_code']}")
@@ -926,9 +824,87 @@ if modal is not None:
         if result.get("details_excerpt"):
             print("DETAILS EXCERPT:")
             print(result["details_excerpt"])
-        if result.get("extraction_stderr"):
-            print("EXTRACTION STDERR:")
-            print(result["extraction_stderr"])
         if result["stderr"]:
-            print("STDERR:")
             print(result["stderr"])
+        if result["extraction_stderr"]:
+            print(result["extraction_stderr"])
+
+    def profile_shape(
+        workspace_layout: WorkspaceLayout,
+        target: ProfileTarget,
+        *,
+        shape,
+        warmup: int,
+        seed: int,
+        ncu_set: str,
+    ) -> None:
+        from datetime import datetime
+        from scripts.profile_utils import format_run_id
+
+        run_id = format_run_id(target.build_target, shape, f"{datetime.now():%Y%m%d_%H%M%S}")
+
+        result = run_profile.remote(
+            target_json=json.dumps(
+                {
+                    "backend": target.backend,
+                    "entry_file": target.entry_file,
+                    "ncu_kernel_regex": target.ncu_kernel_regex,
+                }
+            ),
+            source_files=read_profile_sources(target),
+            runner_source=build_runner_source(
+                target,
+                shape,
+                warmup=warmup,
+                seed=seed,
+            ),
+            ncu_set=ncu_set,
+            warmup=warmup,
+            run_id=run_id,
+        )
+        downloaded_paths, download_failed = download_profile_artifacts(
+            workspace_layout,
+            target,
+            run_id,
+            result,
+        )
+        print_profile_result(
+            workspace_layout,
+            target,
+            shape,
+            result,
+            downloaded_paths,
+            download_failed,
+        )
+
+    @app.local_entrypoint()
+    def main(
+        workspace: str = ".",
+        batch_size: int = 1,
+        total_seq_len: int = 128,
+        num_seqs: int = 4,
+        cu_seqlens_len: int = 0,
+        warmup: int = 5,
+        seed: int = 7,
+        ncu_set: str = "basic",
+    ) -> None:
+        from scripts.profile_utils import build_profile_shape
+        from scripts.workspace_utils import resolve_workspace
+
+        workspace_layout = resolve_workspace(workspace)
+        target = resolve_profile_target(workspace_layout)
+        shape = build_profile_shape(
+            target.build_target,
+            batch_size=batch_size,
+            total_seq_len=total_seq_len,
+            num_seqs=num_seqs,
+            cu_seqlens_len=cu_seqlens_len,
+        )
+        profile_shape(
+            workspace_layout,
+            target,
+            shape=shape,
+            warmup=warmup,
+            seed=seed,
+            ncu_set=ncu_set,
+        )

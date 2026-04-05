@@ -10,18 +10,19 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+from __future__ import annotations
+
 import sys
+import tempfile
 from pathlib import Path
 
-# Add project root to path for imports
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+
 
 app = modal.App("flashinfer-bench")
-
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
@@ -34,8 +35,10 @@ image = (
         "flashinfer-python",
         "pandas",
         "cupti-python",
+        "nvidia-cutlass",
     )
 )
+
 
 def _is_trace_root(path: Path) -> bool:
     """Return True if path looks like a flashinfer trace-set root."""
@@ -59,12 +62,49 @@ def _resolve_trace_set_path(base_path: str) -> Path:
     )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+@app.function(image=image, gpu="B200:1", timeout=14400, volumes={TRACE_SET_PATH: trace_volume})
+def run_benchmark(
+    config_toml: str,
+    source_files: dict[str, str],
+    config: dict | None = None,
+) -> dict:
+    """Pack the active workspace on Modal and run the benchmark there."""
+    import tomllib as tomllib_remote
 
+    from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
+    from flashinfer_bench.agents import pack_solution_from_files
+
+    config_data = tomllib_remote.loads(config_toml)
+    build_config = config_data["build"]
+    solution_config = config_data["solution"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for relative_path, content in source_files.items():
+            output_path = Path(tmpdir) / relative_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(content)
+
+        language = build_config["language"]
+        build_language = "triton" if language == "cute" else language
+        spec = BuildSpec(
+            language=build_language,
+            target_hardware=["cuda"],
+            entry_point=build_config["entry_point"],
+            binding=build_config.get("binding"),
+        )
+        solution = pack_solution_from_files(
+            path=tmpdir,
+            spec=spec,
+            name=solution_config["name"],
+            definition=solution_config["definition"],
+            author=solution_config["author"],
+        )
+
+    benchmark_config = BenchmarkConfig(**config) if config else BenchmarkConfig(
+        warmup_runs=3,
+        iterations=100,
+        num_trials=5,
+    )
     trace_set_path = _resolve_trace_set_path(TRACE_SET_PATH)
     trace_set = TraceSet.from_path(trace_set_path)
 
@@ -77,7 +117,6 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])
-
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
@@ -88,70 +127,74 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         workloads={definition.name: workloads},
         traces={definition.name: []},
     )
-
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
-
+    result_trace_set = Benchmark(bench_trace_set, benchmark_config).run_all(dump_traces=True)
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
 
     for trace in traces:
-        if trace.evaluation:
-            entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
-            }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            results[definition.name][trace.workload.uuid] = entry
+        if not trace.evaluation:
+            continue
+        entry = {
+            "status": trace.evaluation.status.value,
+            "solution": trace.solution,
+        }
+        if trace.evaluation.performance:
+            entry["latency_ms"] = trace.evaluation.performance.latency_ms
+            entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+            entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
+        if trace.evaluation.correctness:
+            entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
+            entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+        results[definition.name][trace.workload.uuid] = entry
 
+    results["_solution_json"] = solution.model_dump_json(indent=2)
     return results
 
 
-def print_results(results: dict):
+def print_results(results: dict) -> None:
     """Print benchmark results in a formatted way."""
-    for def_name, traces in results.items():
-        print(f"\n{def_name}:")
+    for definition_name, traces in results.items():
+        print(f"\n{definition_name}:")
         for workload_uuid, result in traces.items():
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
-
             if result.get("latency_ms") is not None:
                 print(f" | {result['latency_ms'] * 1000:.3f} µs", end="")
-
             if result.get("speedup_factor") is not None:
                 print(f" | {result['speedup_factor']:.2f}x speedup", end="")
-
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
                 rel_err = result.get("max_rel_error", 0)
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
-
             print()
 
 
 @app.local_entrypoint()
-def main():
-    """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+def main(workspace: str = ".") -> None:
+    """Read one workspace locally and benchmark it on Modal."""
+    from scripts.workspace_utils import read_workspace_tree, resolve_build_target, resolve_workspace
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    workspace_layout = resolve_workspace(workspace)
+    build_target = resolve_build_target(workspace_layout)
+    source_root = build_target.source_dir.relative_to(workspace_layout.root).as_posix()
+    source_files = {
+        Path(relative_path).relative_to(source_root).as_posix(): content
+        for relative_path, content in read_workspace_tree(workspace_layout, source_root).items()
+    }
+    config_toml = workspace_layout.config_path.read_text(encoding="utf-8")
 
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+    print(f"Read {len(source_files)} files from {source_root}/")
+    print(f"Entry point: {build_target.entry_file}::{build_target.entry_function}")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
-
+    print("\nRunning pack + benchmark on Modal B200...")
+    results = run_benchmark.remote(config_toml, source_files)
     if not results:
         print("No results returned!")
         return
+
+    solution_json = results.pop("_solution_json", None)
+    if solution_json is not None:
+        workspace_layout.solution_json_path.write_text(solution_json, encoding="utf-8")
+        print(f"\nSolution saved to {workspace_layout.solution_json_path}")
 
     print_results(results)

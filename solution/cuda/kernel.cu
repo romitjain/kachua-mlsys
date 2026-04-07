@@ -487,41 +487,106 @@ __global__ __launch_bounds__(kWarpSize, 1) void gdn_v3(
             const float4 sv = {h[row][0], h[row][1], h[row][2], h[row][3]};
             __stcs(reinterpret_cast<float4*>(new_state + state_base + v_idx * kHeadSize + k_base), sv);
         }
-    } else {
-        // BV=2 and BV=4: original v4 loop structure (2 rows at a time).
-        // The compiler exploits cross-iteration pipelining between row-pairs,
-        // issuing the next pair's FMULs during warp_reduce_2 stall cycles.
-#pragma unroll
-        for (int row = 0; row < BV; row += 2) {
-            float old_v0 = 0.0f, old_v1 = 0.0f;
-#pragma unroll
-            for (int i = 0; i < kKVec; ++i) {
-                h[row][i] *= gate;
-                h[row + 1][i] *= gate;
-                old_v0 = fmaf(k_reg[i], h[row][i], old_v0);
-                old_v1 = fmaf(k_reg[i], h[row + 1][i], old_v1);
-            }
-            warp_reduce_2(old_v0, old_v1);
-            const float dv0 = beta * (v_reg[row] - old_v0);
-            const float dv1 = beta * (v_reg[row + 1] - old_v1);
-            float out0 = 0.0f, out1 = 0.0f;
-#pragma unroll
-            for (int i = 0; i < kKVec; ++i) {
-                h[row][i] = fmaf(dv0, k_reg[i], h[row][i]);
-                h[row + 1][i] = fmaf(dv1, k_reg[i], h[row + 1][i]);
-                out0 = fmaf(q_reg[i], h[row][i], out0);
-                out1 = fmaf(q_reg[i], h[row + 1][i], out1);
-            }
-            warp_reduce_2(out0, out1);
-            out_vals[row] = out0;
-            out_vals[row + 1] = out1;
+    } else if constexpr (BV == 4) {
+        // All-rows approach for BV=4: same structure as BV=8.
+        // 4 rows × kKVec=4: each accumulator accessed every 4 instructions
+        // → exactly matches Blackwell FFMA latency (4 cycles) → zero stalls.
 
-            const int v_idx0 = i_v * BV + row, v_idx1 = v_idx0 + 1;
-            const float4 sv0 = {h[row][0], h[row][1], h[row][2], h[row][3]};
-            const float4 sv1 = {h[row+1][0], h[row+1][1], h[row+1][2], h[row+1][3]};
-            __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx0*kHeadSize+k_base), sv0);
-            __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx1*kHeadSize+k_base), sv1);
+        // Gate decay: 16 independent FMULs
+        h[0][0]*=gate; h[1][0]*=gate; h[2][0]*=gate; h[3][0]*=gate;
+        h[0][1]*=gate; h[1][1]*=gate; h[2][1]*=gate; h[3][1]*=gate;
+        h[0][2]*=gate; h[1][2]*=gate; h[2][2]*=gate; h[3][2]*=gate;
+        h[0][3]*=gate; h[1][3]*=gate; h[2][3]*=gate; h[3][3]*=gate;
+
+        // old_v: 4 independent accumulators, column-major → zero accumulator stalls
+        float p0=0,p1=0,p2=0,p3=0;
+        p0=fmaf(k_reg[0],h[0][0],p0); p1=fmaf(k_reg[0],h[1][0],p1);
+        p2=fmaf(k_reg[0],h[2][0],p2); p3=fmaf(k_reg[0],h[3][0],p3);
+        p0=fmaf(k_reg[1],h[0][1],p0); p1=fmaf(k_reg[1],h[1][1],p1);
+        p2=fmaf(k_reg[1],h[2][1],p2); p3=fmaf(k_reg[1],h[3][1],p3);
+        p0=fmaf(k_reg[2],h[0][2],p0); p1=fmaf(k_reg[2],h[1][2],p1);
+        p2=fmaf(k_reg[2],h[2][2],p2); p3=fmaf(k_reg[2],h[3][2],p3);
+        p0=fmaf(k_reg[3],h[0][3],p0); p1=fmaf(k_reg[3],h[1][3],p1);
+        p2=fmaf(k_reg[3],h[2][3],p2); p3=fmaf(k_reg[3],h[3][3],p3);
+
+        warp_reduce_4(p0,p1,p2,p3);
+
+        const float dv0=beta*(v_reg[0]-p0); const float dv1=beta*(v_reg[1]-p1);
+        const float dv2=beta*(v_reg[2]-p2); const float dv3=beta*(v_reg[3]-p3);
+
+        // Phase A: state update — 16 independent FMAs
+        h[0][0]=fmaf(dv0,k_reg[0],h[0][0]); h[1][0]=fmaf(dv1,k_reg[0],h[1][0]);
+        h[2][0]=fmaf(dv2,k_reg[0],h[2][0]); h[3][0]=fmaf(dv3,k_reg[0],h[3][0]);
+        h[0][1]=fmaf(dv0,k_reg[1],h[0][1]); h[1][1]=fmaf(dv1,k_reg[1],h[1][1]);
+        h[2][1]=fmaf(dv2,k_reg[1],h[2][1]); h[3][1]=fmaf(dv3,k_reg[1],h[3][1]);
+        h[0][2]=fmaf(dv0,k_reg[2],h[0][2]); h[1][2]=fmaf(dv1,k_reg[2],h[1][2]);
+        h[2][2]=fmaf(dv2,k_reg[2],h[2][2]); h[3][2]=fmaf(dv3,k_reg[2],h[3][2]);
+        h[0][3]=fmaf(dv0,k_reg[3],h[0][3]); h[1][3]=fmaf(dv1,k_reg[3],h[1][3]);
+        h[2][3]=fmaf(dv2,k_reg[3],h[2][3]); h[3][3]=fmaf(dv3,k_reg[3],h[3][3]);
+
+        // Phase B: output — h[] writes are 16 FMAs old → no h[] RAW stall
+        float o0=0,o1=0,o2=0,o3=0;
+        o0=fmaf(q_reg[0],h[0][0],o0); o1=fmaf(q_reg[0],h[1][0],o1);
+        o2=fmaf(q_reg[0],h[2][0],o2); o3=fmaf(q_reg[0],h[3][0],o3);
+        o0=fmaf(q_reg[1],h[0][1],o0); o1=fmaf(q_reg[1],h[1][1],o1);
+        o2=fmaf(q_reg[1],h[2][1],o2); o3=fmaf(q_reg[1],h[3][1],o3);
+        o0=fmaf(q_reg[2],h[0][2],o0); o1=fmaf(q_reg[2],h[1][2],o1);
+        o2=fmaf(q_reg[2],h[2][2],o2); o3=fmaf(q_reg[2],h[3][2],o3);
+        o0=fmaf(q_reg[3],h[0][3],o0); o1=fmaf(q_reg[3],h[1][3],o1);
+        o2=fmaf(q_reg[3],h[2][3],o2); o3=fmaf(q_reg[3],h[3][3],o3);
+
+        warp_reduce_4(o0,o1,o2,o3);
+
+        out_vals[0]=o0; out_vals[1]=o1; out_vals[2]=o2; out_vals[3]=o3;
+
+#pragma unroll
+        for (int row = 0; row < 4; ++row) {
+            const int v_idx = i_v * 4 + row;
+            const float4 sv = {h[row][0], h[row][1], h[row][2], h[row][3]};
+            __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx*kHeadSize+k_base), sv);
         }
+    } else {
+        // BV=2: fully separated phases to eliminate h[] RAW stalls.
+        // Gate decays all before old_v (eliminates gate→old_v RAW stalls too).
+
+        // Gate decay: 8 independent FMULs
+        h[0][0]*=gate; h[1][0]*=gate;
+        h[0][1]*=gate; h[1][1]*=gate;
+        h[0][2]*=gate; h[1][2]*=gate;
+        h[0][3]*=gate; h[1][3]*=gate;
+
+        // old_v: h[] writes are 8 FMAs ago → no gate→old_v RAW stall
+        float p0=0,p1=0;
+        p0=fmaf(k_reg[0],h[0][0],p0); p1=fmaf(k_reg[0],h[1][0],p1);
+        p0=fmaf(k_reg[1],h[0][1],p0); p1=fmaf(k_reg[1],h[1][1],p1);
+        p0=fmaf(k_reg[2],h[0][2],p0); p1=fmaf(k_reg[2],h[1][2],p1);
+        p0=fmaf(k_reg[3],h[0][3],p0); p1=fmaf(k_reg[3],h[1][3],p1);
+
+        warp_reduce_2(p0,p1);
+        const float dv0=beta*(v_reg[0]-p0);
+        const float dv1=beta*(v_reg[1]-p1);
+
+        // Phase A: state update — 8 FMAs
+        h[0][0]=fmaf(dv0,k_reg[0],h[0][0]); h[1][0]=fmaf(dv1,k_reg[0],h[1][0]);
+        h[0][1]=fmaf(dv0,k_reg[1],h[0][1]); h[1][1]=fmaf(dv1,k_reg[1],h[1][1]);
+        h[0][2]=fmaf(dv0,k_reg[2],h[0][2]); h[1][2]=fmaf(dv1,k_reg[2],h[1][2]);
+        h[0][3]=fmaf(dv0,k_reg[3],h[0][3]); h[1][3]=fmaf(dv1,k_reg[3],h[1][3]);
+
+        // Phase B: output — h[] writes are 8 FMAs old → no h[] RAW stall
+        float o0=0,o1=0;
+        o0=fmaf(q_reg[0],h[0][0],o0); o1=fmaf(q_reg[0],h[1][0],o1);
+        o0=fmaf(q_reg[1],h[0][1],o0); o1=fmaf(q_reg[1],h[1][1],o1);
+        o0=fmaf(q_reg[2],h[0][2],o0); o1=fmaf(q_reg[2],h[1][2],o1);
+        o0=fmaf(q_reg[3],h[0][3],o0); o1=fmaf(q_reg[3],h[1][3],o1);
+
+        warp_reduce_2(o0,o1);
+        out_vals[0]=o0; out_vals[1]=o1;
+
+        const int v_idx0 = i_v * 2, v_idx1 = v_idx0 + 1;
+        const float4 sv0 = {h[0][0], h[0][1], h[0][2], h[0][3]};
+        const float4 sv1 = {h[1][0], h[1][1], h[1][2], h[1][3]};
+        __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx0*kHeadSize+k_base), sv0);
+        __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx1*kHeadSize+k_base), sv1);
     }
 
     // Out store

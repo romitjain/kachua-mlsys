@@ -132,21 +132,30 @@ def run_benchmark(
     if not workloads:
         raise ValueError(f"No workloads found for '{solution.definition}'")
 
-    bench_trace_set = TraceSet(
-        root=trace_set.root,
-        definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
-        workloads={definition.name: workloads},
-        traces={definition.name: []},
-    )
-
-    benchmark = Benchmark(bench_trace_set, bench_config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
-
-    traces = result_trace_set.traces.get(definition.name, [])
+    import time
+    total = len(workloads)
+    print(f"[bench] Packed solution: {solution.name} ({solution.definition})")
+    print(f"[bench] Found {total} workloads. Running one-at-a-time with progress...")
     results = {definition.name: {}}
-    for trace in traces:
-        if trace.evaluation:
+    t0 = time.time()
+
+    for wi, workload in enumerate(workloads):
+        wl_start = time.time()
+        single_trace_set = TraceSet(
+            root=trace_set.root,
+            definitions={definition.name: definition},
+            solutions={definition.name: [solution]},
+            workloads={definition.name: [workload]},
+            traces={definition.name: []},
+        )
+        benchmark = Benchmark(single_trace_set, bench_config)
+        result_trace_set = benchmark.run_all(dump_traces=True)
+        wl_elapsed = time.time() - wl_start
+
+        traces = result_trace_set.traces.get(definition.name, [])
+        for trace in traces:
+            if not trace.evaluation:
+                continue
             entry = {
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
@@ -159,7 +168,17 @@ def run_benchmark(
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
+
+            status = entry["status"]
+            latency = f"{entry.get('latency_ms', 0) * 1000:.1f}µs" if entry.get("latency_ms") else "?"
+            speedup = f"{entry.get('speedup_factor', 0):.1f}x" if entry.get("speedup_factor") else "?"
+            print(f"[bench] [{wi+1}/{total}] {status} | {latency} | {speedup} ({wl_elapsed:.1f}s)")
+
+    total_elapsed = time.time() - t0
+    print(f"[bench] Done. {total} workloads in {total_elapsed:.1f}s")
+
     return results
+
 
 
 def print_results(results: dict):

@@ -68,13 +68,13 @@ def gdn_prefill_chunked_kernel(
     o_bk = tl.arange(0, BK)
 
     s_base = state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
-    state0 = tl.load(s_base + o_bv[:, None] * K + o_bk[None, :]).to(tl.float64)
-    state1 = tl.load(s_base + o_bv[:, None] * K + (o_bk + BK)[None, :]).to(tl.float64)
+    state0 = tl.load(s_base + o_bv[:, None] * K + o_bk[None, :]).to(tl.float32)
+    state1 = tl.load(s_base + o_bv[:, None] * K + (o_bk + BK)[None, :]).to(tl.float32)
 
     ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
     if seq_end <= seq_start:
-        tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0.to(tl.float32))
-        tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1.to(tl.float32))
+        tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0)
+        tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1)
         return
 
     A_log_val = tl.load(A_log_ptr + pid_h).to(tl.float32)
@@ -169,14 +169,14 @@ def gdn_prefill_chunked_kernel(
             k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
             k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
             kfwd_tile = tl.exp(log_gamma_C - log_gamma)[:, None] * k_tile
-            update = tl.dot(delta_T, kfwd_tile, input_precision="ieee").to(tl.float64)
+            update = tl.dot(delta_T, kfwd_tile, input_precision="ieee")
             if bk_off == 0:
-                state0 = gamma_C.to(tl.float64) * state0 + update
+                state0 = gamma_C * state0 + update
             else:
-                state1 = gamma_C.to(tl.float64) * state1 + update
+                state1 = gamma_C * state1 + update
 
-    tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0.to(tl.float32))
-    tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1.to(tl.float32))
+    tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0)
+    tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1)
 
 
 @register_func("flashinfer.kernel")

@@ -88,30 +88,35 @@ def load_kernel() -> tuple[str, str, Callable]:
     language = config["build"]["language"]
     binding = config["build"].get("binding")
 
-    if language != "cuda" or binding != "torch":
+    if language != "triton":
         raise NotImplementedError(
-            "bench_fi_timing.py currently supports the current CUDA torch binding only."
+            f"This prefill workspace only supports language='triton', got {language!r}."
         )
 
-    import solution.cuda.binding as binding_module
+    import importlib.util
 
-    def kernel(q, k, v, state, A_log, a, dt_bias, b, scale=None):
-        B, _, _, K = q.shape
-        _, _, num_v_heads, V = v.shape
+    entry_file, entry_function = config["build"]["entry_point"].split("::", maxsplit=1)
+    kernel_path = PROJECT_ROOT / "solution" / "triton" / entry_file
+    spec = importlib.util.spec_from_file_location("triton_kernel", str(kernel_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    entry_fn = getattr(mod, entry_function)
 
-        if scale is None or scale == 0:
-            scale_ = 1.0 / math.sqrt(K)
-        else:
-            scale_ = float(scale)
-
-        out = torch.empty((B, num_v_heads, V), dtype=torch.bfloat16, device=q.device)
-        new_state = torch.empty_like(state)
-
-        ext = binding_module._load_extension()
-        ext.launch_gdn(q, k, v, state, A_log, a, dt_bias, b, scale_, out, new_state)
+    def triton_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale=None):
+        T = q.shape[0]
+        num_v_heads = v.shape[1]
+        V = v.shape[2]
+        K = k.shape[2]
+        num_seqs = int(cu_seqlens.numel() - 1)
+        scale_ = 1.0 / math.sqrt(K) if scale is None or scale == 0 else float(scale)
+        out = torch.empty((T, num_v_heads, V), dtype=torch.bfloat16, device=q.device)
+        new_state = torch.empty(
+            (num_seqs, num_v_heads, V, K), dtype=torch.float32, device=q.device,
+        )
+        entry_fn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_, out, new_state)
         return out, new_state
 
-    return solution_name, definition_name, kernel
+    return solution_name, definition_name, triton_kernel
 
 
 def _dtype_from_name(dtype_name: str) -> torch.dtype:

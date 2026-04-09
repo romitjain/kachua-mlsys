@@ -145,15 +145,15 @@ def gdn_prefill_kernel(
     o_v = tl.arange(0, BV)
     v_start = pid_v * BV
 
-    ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
-    ns_ptrs = ns_base + o_v[:, None] * K + o_k[None, :]
-    if seq_end <= seq_start:
-        tl.store(ns_ptrs, tl.zeros((BV, K), dtype=tl.float32))
-        return
-
     s_base = state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
     s_ptrs = s_base + o_v[:, None] * K + o_k[None, :]
     state_tile = tl.load(s_ptrs).to(tl.float32)
+
+    ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
+    ns_ptrs = ns_base + o_v[:, None] * K + o_k[None, :]
+    if seq_end <= seq_start:
+        tl.store(ns_ptrs, state_tile)
+        return
     A_log_val = tl.load(A_log_ptr + pid_h).to(tl.float32)
     dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
 
@@ -287,20 +287,19 @@ def gdn_prefill_kernel_long(
     o_k = tl.arange(0, K)
     v_start = pid_v * BV
 
-    ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
-    ns_ptrs0 = ns_base + pair_rows[:, None] * K + o_k[None, :]
-    ns_ptrs1 = ns_base + (pair_rows + (BV // 2))[:, None] * K + o_k[None, :]
-    if seq_end <= seq_start:
-        zeros = tl.zeros((BV // 2, K), dtype=tl.float32)
-        tl.store(ns_ptrs0, zeros)
-        tl.store(ns_ptrs1, zeros)
-        return
-
     s_base = state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
     s_ptrs0 = s_base + pair_rows[:, None] * K + o_k[None, :]
     s_ptrs1 = s_base + (pair_rows + (BV // 2))[:, None] * K + o_k[None, :]
     state_tile0 = tl.load(s_ptrs0).to(tl.float32)
     state_tile1 = tl.load(s_ptrs1).to(tl.float32)
+
+    ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
+    ns_ptrs0 = ns_base + pair_rows[:, None] * K + o_k[None, :]
+    ns_ptrs1 = ns_base + (pair_rows + (BV // 2))[:, None] * K + o_k[None, :]
+    if seq_end <= seq_start:
+        tl.store(ns_ptrs0, state_tile0)
+        tl.store(ns_ptrs1, state_tile1)
+        return
     A_log_val = tl.load(A_log_ptr + pid_h).to(tl.float32)
     dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
 

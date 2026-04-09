@@ -28,7 +28,7 @@ STARVED_NUM_WARPS: int = 1
 STARVED_NUM_STAGES: int = 2
 
 CHUNK_SIZE: int = 32
-CHUNK_THRESHOLD: int = 256
+CHUNK_THRESHOLD: int = 128
 CHUNK_BK: int = 64
 
 
@@ -68,13 +68,13 @@ def gdn_prefill_chunked_kernel(
     o_bk = tl.arange(0, BK)
 
     s_base = state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
-    state0 = tl.load(s_base + o_bv[:, None] * K + o_bk[None, :]).to(tl.float32)
-    state1 = tl.load(s_base + o_bv[:, None] * K + (o_bk + BK)[None, :]).to(tl.float32)
+    state0 = tl.load(s_base + o_bv[:, None] * K + o_bk[None, :]).to(tl.float64)
+    state1 = tl.load(s_base + o_bv[:, None] * K + (o_bk + BK)[None, :]).to(tl.float64)
 
     ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
     if seq_end <= seq_start:
-        tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0)
-        tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1)
+        tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0.to(tl.float32))
+        tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1.to(tl.float32))
         return
 
     A_log_val = tl.load(A_log_ptr + pid_h).to(tl.float32)
@@ -127,7 +127,7 @@ def gdn_prefill_chunked_kernel(
             k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
             q_base = q_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
             q_tile = tl.load(q_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
-            s_tile = tl.load(s_base + o_bv[:, None] * K + (o_bk[None, :] + bk_off)).to(tl.float32)
+            s_tile = (state0 if bk_off == 0 else state1).to(tl.float32)
 
             rhs_w = beta[:, None] * k_tile
             W_bk = rhs_w + tl.zeros((C, BK), dtype=tl.float32)
@@ -169,14 +169,14 @@ def gdn_prefill_chunked_kernel(
             k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
             k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
             kfwd_tile = tl.exp(log_gamma_C - log_gamma)[:, None] * k_tile
-            update = tl.dot(delta_T, kfwd_tile, input_precision="ieee")
+            update = tl.dot(delta_T, kfwd_tile, input_precision="ieee").to(tl.float64)
             if bk_off == 0:
-                state0 = gamma_C * state0 + update
+                state0 = gamma_C.to(tl.float64) * state0 + update
             else:
-                state1 = gamma_C * state1 + update
+                state1 = gamma_C.to(tl.float64) * state1 + update
 
-    tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0)
-    tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1)
+    tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0.to(tl.float32))
+    tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1.to(tl.float32))
 
 
 @register_func("flashinfer.kernel")
@@ -230,7 +230,7 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
             NUM_V_HEADS=NUM_V_HEADS, NUM_K_HEADS=NUM_K_HEADS,
             GVA_RATIO=GVA_RATIO, BV=bv, N_V_TILES=n_v_tiles,
             C=CHUNK_SIZE, BK=CHUNK_BK,
-            num_warps=4, num_stages=2,
+            num_warps=8, num_stages=1,
         )
         return output_tensor, new_state_tensor
 

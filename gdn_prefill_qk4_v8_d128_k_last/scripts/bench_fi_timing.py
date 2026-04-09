@@ -97,9 +97,14 @@ def load_kernel() -> tuple[str, str, Callable]:
 
     entry_file, entry_function = config["build"]["entry_point"].split("::", maxsplit=1)
     kernel_path = PROJECT_ROOT / "solution" / "triton" / entry_file
-    spec = importlib.util.spec_from_file_location("triton_kernel", str(kernel_path))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod_name = "triton_kernel"
+    if mod_name in sys.modules:
+        mod = sys.modules[mod_name]
+    else:
+        spec = importlib.util.spec_from_file_location(mod_name, str(kernel_path))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
     entry_fn = getattr(mod, entry_function)
 
     def triton_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale=None):

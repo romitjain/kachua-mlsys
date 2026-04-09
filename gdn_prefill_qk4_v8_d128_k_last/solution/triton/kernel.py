@@ -27,127 +27,151 @@ STARVED_BV: int = 2
 STARVED_NUM_WARPS: int = 1
 STARVED_NUM_STAGES: int = 2
 
-CHUNK_SIZE: int = 64
+CHUNK_SIZE: int = 32
 CHUNK_THRESHOLD: int = 128
-
-import torch.nn.functional as F
-
-
-def _chunk_summary_batched(
-    k_chunk: torch.Tensor,
-    v_chunk: torch.Tensor,
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched chunk summary across all V-heads.
-
-    k_chunk: [H, C_actual, d_k] f32 (H = NUM_V_HEADS, expanded via GVA)
-    v_chunk: [H, C_actual, d_v] f32
-    alpha: [H, C_actual] f32
-    beta: [H, C_actual] f32
-    Returns: (W_bar, U_tilde, K_fwd, gamma_vec, gamma_C) batched over H
-    """
-    H, C_actual, d = k_chunk.shape
-    device = k_chunk.device
-
-    gamma_vec = torch.cumprod(alpha, dim=1)
-    gamma_C = gamma_vec[:, -1]
-
-    bk = beta.unsqueeze(-1) * k_chunk
-    bv = beta.unsqueeze(-1) * v_chunk
-    gram = torch.bmm(k_chunk, k_chunk.transpose(1, 2))
-    L = torch.tril(beta.unsqueeze(-1) * gram, diagonal=-1)
-
-    eye = torch.eye(C_actual, device=device, dtype=torch.float32).unsqueeze(0)
-    A = eye.expand(H, -1, -1).clone()
-    for _ in range(C_actual - 1):
-        A = eye - torch.bmm(L, A)
-
-    W = torch.bmm(A, bk)
-    rhs_u = (1.0 / gamma_vec.unsqueeze(-1)) * bv
-    temp = torch.bmm(A, rhs_u)
-    U_tilde = gamma_vec.unsqueeze(-1) * temp
-
-    W_bar = gamma_vec.unsqueeze(-1) * W
-    K_fwd = (gamma_C.unsqueeze(-1) / gamma_vec).unsqueeze(-1) * k_chunk
-
-    return W_bar, U_tilde, K_fwd, gamma_vec, gamma_C
+CHUNK_BK: int = 64
 
 
-def _launch_chunked(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    state_tensor: torch.Tensor,
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    b: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    scale: float,
-    output_tensor: torch.Tensor,
-    new_state_tensor: torch.Tensor,
+@triton.jit
+def gdn_prefill_chunked_kernel(
+    q_ptr, k_ptr, v_ptr, state_ptr,
+    A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
+    cu_seqlens_ptr, out_ptr, new_state_ptr,
+    scale,
+    K: tl.constexpr,
+    V_DIM: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    NUM_K_HEADS: tl.constexpr,
+    GVA_RATIO: tl.constexpr,
+    BV: tl.constexpr,
+    N_V_TILES: tl.constexpr,
+    C: tl.constexpr,
+    BK: tl.constexpr,
 ):
-    """Chunkwise GDN prefill: batched across all V-heads using PyTorch ops."""
-    num_seqs = int(cu_seqlens.numel() - 1)
-    C = CHUNK_SIZE
-    device = q.device
-    H = NUM_V_HEADS
+    """Fused chunkwise GDN prefill kernel.
 
-    for seq_idx in range(num_seqs):
-        seq_start = int(cu_seqlens[seq_idx].item())
-        seq_end = int(cu_seqlens[seq_idx + 1].item())
-        seq_len = seq_end - seq_start
-        if seq_len <= 0:
-            new_state_tensor[seq_idx] = state_tensor[seq_idx]
-            continue
+    Each CTA handles one (seq, v_head, v_tile) and loops over C-token chunks.
+    Within each chunk: Neumann-series triangular solve + matmul-based output.
+    """
+    pid_seq = tl.program_id(0)
+    pid_hv = tl.program_id(1)
+    pid_h = pid_hv // N_V_TILES
+    pid_v = pid_hv % N_V_TILES
+    qk_head = pid_h // GVA_RATIO
+    v_start = pid_v * BV
 
-        num_chunks = (seq_len + C - 1) // C
-        S = state_tensor[seq_idx].float()
+    seq_start = tl.load(cu_seqlens_ptr + pid_seq).to(tl.int32)
+    seq_end = tl.load(cu_seqlens_ptr + pid_seq + 1).to(tl.int32)
 
-        for chunk_idx in range(num_chunks):
-            t_start = seq_start + chunk_idx * C
-            t_end = min(seq_start + (chunk_idx + 1) * C, seq_end)
-            C_actual = t_end - t_start
+    o_c = tl.arange(0, C)
+    o_bv = tl.arange(0, BV)
+    o_bk = tl.arange(0, BK)
 
-            q_qk = q[t_start:t_end].float()
-            k_qk = k[t_start:t_end].float()
-            v_all = v[t_start:t_end].float()
-            a_all = a[t_start:t_end].float()
-            b_all = b[t_start:t_end].float()
+    s_base = state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
+    state0 = tl.load(s_base + o_bv[:, None] * K + o_bk[None, :]).to(tl.float32)
+    state1 = tl.load(s_base + o_bv[:, None] * K + (o_bk + BK)[None, :]).to(tl.float32)
 
-            k_exp = k_qk.repeat_interleave(GVA_RATIO, dim=1)
-            q_exp = q_qk.repeat_interleave(GVA_RATIO, dim=1)
+    ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
+    if seq_end <= seq_start:
+        tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0)
+        tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1)
+        return
 
-            k_h = k_exp.permute(1, 0, 2)
-            v_h = v_all.permute(1, 0, 2)
-            q_h = q_exp.permute(1, 0, 2)
+    A_log_val = tl.load(A_log_ptr + pid_h).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
 
-            x = a_all.T.float() + dt_bias.float().unsqueeze(-1)
-            softplus_x = torch.where(x > 20.0, x, torch.log(1.0 + torch.exp(x)))
-            alpha_h = torch.exp(-torch.exp(A_log.float().unsqueeze(-1)) * softplus_x)
-            beta_h = torch.sigmoid(b_all.T.float())
+    eye_bool = o_c[:, None] == o_c[None, :]
+    eye_cc = eye_bool.to(tl.float32)
+    causal_bool = o_c[:, None] >= o_c[None, :]
+    mask_cc = causal_bool.to(tl.float32)
+    strict_lower = causal_bool & ~eye_bool
 
-            W_bar, U_tilde, K_fwd, gamma_vec, gamma_C = _chunk_summary_batched(
-                k_h, v_h, alpha_h, beta_h,
-            )
+    for chunk_off in tl.range(seq_start, seq_end, C):
+        c_end = tl.minimum(chunk_off + C, seq_end)
+        c_mask = o_c < (c_end - chunk_off)
 
-            Q_bar = gamma_vec.unsqueeze(-1) * q_h
-            Delta = U_tilde - torch.bmm(W_bar, S)
-            O_state = torch.bmm(Q_bar, S)
-            QK = torch.bmm(q_h, k_h.transpose(1, 2))
-            mask = torch.tril(torch.ones(C_actual, C_actual, device=device, dtype=torch.float32))
-            gamma_ratio = gamma_vec.unsqueeze(-1) / gamma_vec.unsqueeze(-2)
-            QK_masked = QK * mask.unsqueeze(0) * gamma_ratio
-            O_intra = torch.bmm(QK_masked, Delta)
-            O_chunk = scale * (O_state + O_intra)
+        # --- gates ---
+        gate_ptrs = a_ptr + (chunk_off + o_c) * NUM_V_HEADS + pid_h
+        a_vals = tl.load(gate_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+        b_vals = tl.load(b_ptr + (chunk_off + o_c) * NUM_V_HEADS + pid_h, mask=c_mask, other=0.0).to(tl.float32)
 
-            O_out = O_chunk.permute(1, 0, 2).to(torch.bfloat16)
-            output_tensor[t_start:t_end] = O_out
+        x = a_vals + dt_bias_val
+        sp = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
+        alpha = tl.where(c_mask, tl.exp(-tl.exp(A_log_val) * sp), 1.0)
+        beta = tl.where(c_mask, tl.sigmoid(b_vals), 0.0)
 
-            S = gamma_C.unsqueeze(-1).unsqueeze(-1) * S + torch.bmm(Delta.transpose(1, 2), K_fwd)
+        log_gamma = tl.cumsum(tl.log(tl.maximum(alpha, 1e-10)), axis=0)
+        gamma = tl.exp(log_gamma)
+        last_mask = (o_c == C - 1)
+        gamma_C = tl.sum(tl.where(last_mask, gamma, 0.0))
 
-        new_state_tensor[seq_idx] = S
+        # --- L = tril(beta * K @ K^T, -1): accumulate over BK tiles ---
+        L = tl.zeros((C, C), dtype=tl.float32)
+        for bk_off in tl.static_range(0, K, BK):
+            k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
+            k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
+            L += tl.dot(k_tile, tl.trans(k_tile))
+        L = tl.where(strict_lower, beta[:, None] * L, 0.0)
+
+        # --- Neumann series: A = (I + L)^{-1} ---
+        A_inv = eye_cc + tl.zeros((C, C), dtype=tl.float32)
+        for _ in tl.static_range(C - 1):
+            A_inv = eye_cc - tl.dot(L, A_inv)
+
+        # --- Per BK-tile: compute W_bar, Delta, O_state, QK, K_fwd, state update ---
+        delta_bv = tl.zeros((C, BV), dtype=tl.float32)
+        o_state_bv = tl.zeros((C, BV), dtype=tl.float32)
+        QK = tl.zeros((C, C), dtype=tl.float32)
+
+        # Pass A: W_bar @ state^T → Delta accumulator; also build QK
+        for bk_off in tl.static_range(0, K, BK):
+            k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
+            k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
+            q_base = q_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
+            q_tile = tl.load(q_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
+            s_tile = tl.load(s_base + o_bv[:, None] * K + (o_bk[None, :] + bk_off)).to(tl.float32)
+
+            bk_tile = beta[:, None] * k_tile
+            W_bk = tl.dot(A_inv, bk_tile)
+            W_bar_bk = gamma[:, None] * W_bk
+            delta_bv -= tl.dot(W_bar_bk, tl.trans(s_tile))
+
+            Q_bar_bk = gamma[:, None] * q_tile
+            o_state_bv += tl.dot(Q_bar_bk, tl.trans(s_tile))
+
+            QK += tl.dot(q_tile, tl.trans(k_tile))
+
+        # Pass B: U_tilde_BV (BV-slice of v)
+        v_base = v_ptr + (chunk_off + o_c[:, None]) * NUM_V_HEADS * V_DIM + pid_h * V_DIM + (v_start + o_bv[None, :])
+        v_tile = tl.load(v_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
+        bv_tile = (beta / gamma)[:, None] * v_tile
+        u_temp = tl.dot(A_inv, bv_tile)
+        u_tilde_bv = gamma[:, None] * u_temp
+        delta_bv += u_tilde_bv
+
+        # --- Output ---
+        gamma_ratio = gamma[:, None] / gamma[None, :]
+        QK_masked = QK * mask_cc * gamma_ratio
+        o_intra_bv = tl.dot(QK_masked, delta_bv)
+        o_chunk = scale * (o_state_bv + o_intra_bv)
+
+        out_base = out_ptr + (chunk_off + o_c[:, None]) * NUM_V_HEADS * V_DIM + pid_h * V_DIM + (v_start + o_bv[None, :])
+        tl.store(out_base, o_chunk.to(tl.bfloat16), mask=c_mask[:, None])
+
+        # --- State update: S = gamma_C * S + Delta^T @ K_fwd ---
+        delta_T = tl.trans(delta_bv)
+        for bk_off in tl.static_range(0, K, BK):
+            k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
+            k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
+            kfwd_tile = (gamma_C / gamma)[:, None] * k_tile
+            update = tl.dot(delta_T, kfwd_tile)
+            if bk_off == 0:
+                state0 = gamma_C * state0 + update
+            else:
+                state1 = gamma_C * state1 + update
+
+    tl.store(ns_base + o_bv[:, None] * K + o_bk[None, :], state0)
+    tl.store(ns_base + o_bv[:, None] * K + (o_bk + BK)[None, :], state1)
 
 
 @register_func("flashinfer.kernel")
@@ -191,9 +215,17 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
     avg_seq_len = max(1, (q.shape[0] + num_seqs - 1) // num_seqs)
 
     if avg_seq_len >= CHUNK_THRESHOLD:
-        _launch_chunked(
+        bv = BALANCED_BV
+        n_v_tiles = HEAD_DIM // bv
+        grid = (num_seqs, NUM_V_HEADS * n_v_tiles)
+        gdn_prefill_chunked_kernel[grid](
             q, k, v, state_tensor, A_log, a, dt_bias, b,
-            cu_seqlens, scale, output_tensor, new_state_tensor,
+            cu_seqlens, output_tensor, new_state_tensor, scale,
+            K=HEAD_DIM, V_DIM=HEAD_DIM,
+            NUM_V_HEADS=NUM_V_HEADS, NUM_K_HEADS=NUM_K_HEADS,
+            GVA_RATIO=GVA_RATIO, BV=bv, N_V_TILES=n_v_tiles,
+            C=CHUNK_SIZE, BK=CHUNK_BK,
+            num_warps=4, num_stages=2,
         )
         return output_tensor, new_state_tensor
 

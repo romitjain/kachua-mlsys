@@ -1,0 +1,9 @@
+[solution]
+name = "gdn-decode-cuda-v4"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "kachua"
+
+[build]
+language = "cuda"
+entry_point = "kernel.cu::launch_gdn"
+binding = "torch"

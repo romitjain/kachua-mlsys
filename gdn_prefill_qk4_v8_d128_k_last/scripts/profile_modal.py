@@ -1,4 +1,4 @@
-"""Profile the active config.toml kernel on Modal with Nsight Compute."""
+"""Profile the active prefill kernel on Modal with Nsight Compute."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def resolve_profile_target() -> ProfileTarget:
             backend="triton",
             entry_file=entry_file,
             entry_function=entry_function,
-            ncu_kernel_regex="regex:.*gdn_decode_kernel.*",
+            ncu_kernel_regex="regex:.*gdn_prefill_kernel.*",
             source_files=(f"solution/triton/{entry_file}",),
         )
 
@@ -71,7 +71,7 @@ def resolve_profile_target() -> ProfileTarget:
             backend="cute",
             entry_file=entry_file,
             entry_function=entry_function,
-            ncu_kernel_regex="regex:.*gdn_decode_kernel.*",
+            ncu_kernel_regex="regex:.*gdn_prefill_kernel.*",
             source_files=(f"solution/cute/{entry_file}",),
         )
 
@@ -86,7 +86,13 @@ def read_profile_sources(target: ProfileTarget) -> dict[str, str]:
     return sources
 
 
-def build_runner_source(target: ProfileTarget, batch_size: int, warmup: int, seed: int) -> str:
+def build_runner_source(
+    target: ProfileTarget,
+    total_seq_len: int,
+    num_seqs: int,
+    warmup: int,
+    seed: int,
+) -> str:
     """Build the Python runner executed under Nsight Compute inside Modal."""
     base = """
 import importlib.util
@@ -113,6 +119,14 @@ def prepend_env_path(name: str, value: str):
     os.environ[name] = f"{value}:{current}" if current else value
 
 
+def build_cu_seqlens(total_seq_len: int, num_seqs: int, device: str):
+    lengths = torch.full((num_seqs,), total_seq_len // num_seqs, dtype=torch.int64)
+    lengths[: total_seq_len % num_seqs] += 1
+    cu_seqlens = torch.zeros(num_seqs + 1, dtype=torch.int64, device=device)
+    cu_seqlens[1:] = torch.cumsum(lengths.to(device), dim=0)
+    return cu_seqlens
+
+
 spec = importlib.util.find_spec("tvm_ffi")
 if spec is None or not spec.submodule_search_locations:
     raise RuntimeError("apache-tvm-ffi must be installed in the profiling image")
@@ -135,21 +149,23 @@ sys.modules["tvm_ffi"] = stub_tvm_ffi
 
 torch.manual_seed(SEED)
 device = "cuda"
-B = BATCH_SIZE
+T = TOTAL_SEQ_LEN
+N = NUM_SEQS
 K_DIM = 128
 V_DIM = 128
 NUM_Q_HEADS = 4
 NUM_K_HEADS = 4
 NUM_V_HEADS = 8
 
-q = torch.randn(B, 1, NUM_Q_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
-k = torch.randn(B, 1, NUM_K_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
-v = torch.randn(B, 1, NUM_V_HEADS, V_DIM, device=device, dtype=torch.bfloat16)
-state = torch.randn(B, NUM_V_HEADS, V_DIM, K_DIM, device=device, dtype=torch.float32)
+q = torch.randn(T, NUM_Q_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
+k = torch.randn(T, NUM_K_HEADS, K_DIM, device=device, dtype=torch.bfloat16)
+v = torch.randn(T, NUM_V_HEADS, V_DIM, device=device, dtype=torch.bfloat16)
+state = torch.randn(N, NUM_V_HEADS, V_DIM, K_DIM, device=device, dtype=torch.float32)
 A_log = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
-a = torch.randn(B, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+a = torch.randn(T, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
 dt_bias = torch.randn(NUM_V_HEADS, device=device, dtype=torch.float32)
-b = torch.randn(B, 1, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+b = torch.randn(T, NUM_V_HEADS, device=device, dtype=torch.bfloat16)
+cu_seqlens = build_cu_seqlens(T, N, device)
 scale = 1.0 / (K_DIM ** 0.5)
 """
 
@@ -173,14 +189,14 @@ cpp_extension.load = profile_load
 binding = load_module("cuda_binding", str(Path(WORKSPACE) / "solution/cuda/binding.py"))
 run_kernel = getattr(binding, ENTRY_FUNCTION)
 
-run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+run_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 torch.cuda.synchronize()
 
 for _ in range(WARMUP):
-    run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+    run_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 torch.cuda.synchronize()
 
-run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale)
+run_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 torch.cuda.synchronize()
 """
     elif target.backend == "cuda":
@@ -213,11 +229,11 @@ if nvcc_result.returncode != 0:
 _kernel_mod = tvm_ffi.load_module(so_path)
 kernel_func = _kernel_mod[ENTRY_FUNCTION]
 
-output = torch.empty(B, 1, NUM_V_HEADS, V_DIM, dtype=torch.bfloat16, device=device)
-new_state = torch.empty_like(state)
+output = torch.empty(T, NUM_V_HEADS, V_DIM, dtype=torch.bfloat16, device=device)
+new_state = torch.empty(N, NUM_V_HEADS, V_DIM, K_DIM, dtype=torch.float32, device=device)
 
 def invoke():
-    kernel_func(q, k, v, state, A_log, a, dt_bias, b, float(scale), output, new_state)
+    kernel_func(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, float(scale), output, new_state)
 
 invoke()
 torch.cuda.synchronize()
@@ -239,9 +255,9 @@ kernel_module = load_module(
 run_kernel = getattr(kernel_module, ENTRY_FUNCTION)
 
 def invoke():
-    output = torch.empty((B, NUM_V_HEADS, V_DIM), dtype=torch.bfloat16, device=device)
-    new_state = torch.empty_like(state)
-    run_kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state)
+    output = torch.empty((T, NUM_V_HEADS, V_DIM), dtype=torch.bfloat16, device=device)
+    new_state = torch.empty((N, NUM_V_HEADS, V_DIM, K_DIM), dtype=torch.float32, device=device)
+    run_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, new_state)
 
 invoke()
 torch.cuda.synchronize()
@@ -263,7 +279,8 @@ raise ValueError("Unsupported backend for profiling: {target.backend}")
         WORKSPACE = {str(REMOTE_WORKSPACE)!r}
         ENTRY_FILE = {target.entry_file!r}
         ENTRY_FUNCTION = {target.entry_function!r}
-        BATCH_SIZE = {batch_size}
+        TOTAL_SEQ_LEN = {total_seq_len}
+        NUM_SEQS = {num_seqs}
         WARMUP = {warmup}
         SEED = {seed}
         """
@@ -274,7 +291,8 @@ raise ValueError("Unsupported backend for profiling: {target.backend}")
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-size", type=int, default=1, help="Synthetic batch size")
+    parser.add_argument("--total-seq-len", type=int, default=128, help="Total tokens across all sequences")
+    parser.add_argument("--num-seqs", type=int, default=4, help="Number of sequences in the batch")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup launches before profiling")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for synthetic inputs")
     parser.add_argument("--ncu-set", default="full", help="Nsight Compute metric set")
@@ -549,7 +567,8 @@ if modal is not None:
 
     @app.local_entrypoint()
     def main(
-        batch_size: int = 1,
+        total_seq_len: int = 128,
+        num_seqs: int = 4,
         warmup: int = 5,
         seed: int = 7,
         ncu_set: str = "basic",
@@ -557,7 +576,7 @@ if modal is not None:
         from datetime import datetime
 
         target = resolve_profile_target()
-        run_id = f"{datetime.now():%Y%m%d_%H%M%S}_b{batch_size}"
+        run_id = f"{datetime.now():%Y%m%d_%H%M%S}_t{total_seq_len}_n{num_seqs}"
 
         result = run_profile.remote(
             target_json=json.dumps(
@@ -568,7 +587,13 @@ if modal is not None:
                 }
             ),
             source_files=read_profile_sources(target),
-            runner_source=build_runner_source(target, batch_size=batch_size, warmup=warmup, seed=seed),
+            runner_source=build_runner_source(
+                target,
+                total_seq_len=total_seq_len,
+                num_seqs=num_seqs,
+                warmup=warmup,
+                seed=seed,
+            ),
             ncu_set=ncu_set,
             warmup=warmup,
             run_id=run_id,

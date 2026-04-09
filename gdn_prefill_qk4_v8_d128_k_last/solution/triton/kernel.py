@@ -28,7 +28,7 @@ STARVED_NUM_WARPS: int = 1
 STARVED_NUM_STAGES: int = 2
 
 CHUNK_SIZE: int = 32
-CHUNK_THRESHOLD: int = 128
+CHUNK_THRESHOLD: int = 256
 CHUNK_BK: int = 64
 
 
@@ -100,30 +100,28 @@ def gdn_prefill_chunked_kernel(
         alpha = tl.where(c_mask, tl.exp(-tl.exp(A_log_val) * sp), 1.0)
         beta = tl.where(c_mask, tl.sigmoid(b_vals), 0.0)
 
-        log_gamma = tl.cumsum(tl.log(tl.maximum(alpha, 1e-10)), axis=0)
-        gamma = tl.exp(log_gamma)
+        log_alpha = tl.log(tl.maximum(alpha, 1e-30))
+        log_gamma = tl.cumsum(log_alpha, axis=0)
         last_mask = (o_c == C - 1)
-        gamma_C = tl.sum(tl.where(last_mask, gamma, 0.0))
+        log_gamma_C = tl.sum(tl.where(last_mask, log_gamma, 0.0))
+        gamma = tl.exp(log_gamma)
+        gamma_C = tl.exp(log_gamma_C)
 
         # --- L = tril(beta * K @ K^T, -1): accumulate over BK tiles ---
         L = tl.zeros((C, C), dtype=tl.float32)
         for bk_off in tl.static_range(0, K, BK):
             k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
             k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
-            L += tl.dot(k_tile, tl.trans(k_tile))
+            L += tl.dot(k_tile, tl.trans(k_tile), input_precision="ieee")
         L = tl.where(strict_lower, beta[:, None] * L, 0.0)
 
-        # --- Neumann series: A = (I + L)^{-1} ---
-        A_inv = eye_cc + tl.zeros((C, C), dtype=tl.float32)
-        for _ in tl.static_range(C - 1):
-            A_inv = eye_cc - tl.dot(L, A_inv)
-
-        # --- Per BK-tile: compute W_bar, Delta, O_state, QK, K_fwd, state update ---
+        # --- Forward substitution: solve (I+L)@W = B*K and (I+L)@U_rhs = G^{-1}*B*V ---
+        # Jacobi iteration: W = rhs - L@W, converges in C-1 steps for strictly lower L
         delta_bv = tl.zeros((C, BV), dtype=tl.float32)
         o_state_bv = tl.zeros((C, BV), dtype=tl.float32)
         QK = tl.zeros((C, C), dtype=tl.float32)
 
-        # Pass A: W_bar @ state^T → Delta accumulator; also build QK
+        # Solve for W (per BK tile) and accumulate Delta, O_state, QK
         for bk_off in tl.static_range(0, K, BK):
             k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
             k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
@@ -131,28 +129,35 @@ def gdn_prefill_chunked_kernel(
             q_tile = tl.load(q_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
             s_tile = tl.load(s_base + o_bv[:, None] * K + (o_bk[None, :] + bk_off)).to(tl.float32)
 
-            bk_tile = beta[:, None] * k_tile
-            W_bk = tl.dot(A_inv, bk_tile)
+            rhs_w = beta[:, None] * k_tile
+            W_bk = rhs_w + tl.zeros((C, BK), dtype=tl.float32)
+            for _ in tl.static_range(C - 1):
+                W_bk = rhs_w - tl.dot(L, W_bk, input_precision="ieee")
+
             W_bar_bk = gamma[:, None] * W_bk
-            delta_bv -= tl.dot(W_bar_bk, tl.trans(s_tile))
+            delta_bv -= tl.dot(W_bar_bk, tl.trans(s_tile), input_precision="ieee")
 
             Q_bar_bk = gamma[:, None] * q_tile
-            o_state_bv += tl.dot(Q_bar_bk, tl.trans(s_tile))
+            o_state_bv += tl.dot(Q_bar_bk, tl.trans(s_tile), input_precision="ieee")
 
-            QK += tl.dot(q_tile, tl.trans(k_tile))
+            QK += tl.dot(q_tile, tl.trans(k_tile), input_precision="ieee")
 
-        # Pass B: U_tilde_BV (BV-slice of v)
+        # Solve for U_tilde (BV-slice of v) using N^{-1} = G * M^{-1} * G^{-1}
         v_base = v_ptr + (chunk_off + o_c[:, None]) * NUM_V_HEADS * V_DIM + pid_h * V_DIM + (v_start + o_bv[None, :])
         v_tile = tl.load(v_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
-        bv_tile = (beta / gamma)[:, None] * v_tile
-        u_temp = tl.dot(A_inv, bv_tile)
+        beta_over_gamma = beta * tl.exp(-log_gamma)
+        rhs_u = beta_over_gamma[:, None] * v_tile
+        u_temp = rhs_u + tl.zeros((C, BV), dtype=tl.float32)
+        for _ in tl.static_range(C - 1):
+            u_temp = rhs_u - tl.dot(L, u_temp, input_precision="ieee")
         u_tilde_bv = gamma[:, None] * u_temp
         delta_bv += u_tilde_bv
 
         # --- Output ---
-        gamma_ratio = gamma[:, None] / gamma[None, :]
+        log_gamma_ratio = log_gamma[:, None] - log_gamma[None, :]
+        gamma_ratio = tl.exp(log_gamma_ratio)
         QK_masked = QK * mask_cc * gamma_ratio
-        o_intra_bv = tl.dot(QK_masked, delta_bv)
+        o_intra_bv = tl.dot(QK_masked, delta_bv, input_precision="ieee")
         o_chunk = scale * (o_state_bv + o_intra_bv)
 
         out_base = out_ptr + (chunk_off + o_c[:, None]) * NUM_V_HEADS * V_DIM + pid_h * V_DIM + (v_start + o_bv[None, :])
@@ -163,8 +168,8 @@ def gdn_prefill_chunked_kernel(
         for bk_off in tl.static_range(0, K, BK):
             k_base = k_ptr + (chunk_off + o_c[:, None]) * NUM_K_HEADS * K + qk_head * K + (o_bk[None, :] + bk_off)
             k_tile = tl.load(k_base, mask=c_mask[:, None], other=0.0).to(tl.float32)
-            kfwd_tile = (gamma_C / gamma)[:, None] * k_tile
-            update = tl.dot(delta_T, kfwd_tile)
+            kfwd_tile = tl.exp(log_gamma_C - log_gamma)[:, None] * k_tile
+            update = tl.dot(delta_T, kfwd_tile, input_precision="ieee")
             if bk_off == 0:
                 state0 = gamma_C * state0 + update
             else:

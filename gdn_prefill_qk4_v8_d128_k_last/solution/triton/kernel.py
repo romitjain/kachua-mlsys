@@ -33,43 +33,43 @@ CHUNK_THRESHOLD: int = 128
 import torch.nn.functional as F
 
 
-def _chunk_summary(
+def _chunk_summary_batched(
     k_chunk: torch.Tensor,
     v_chunk: torch.Tensor,
     alpha: torch.Tensor,
     beta: torch.Tensor,
-    C: int,
-    d_k: int,
-    d_v: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute per-chunk summary tensors for the chunkwise GDN decomposition.
+    """Batched chunk summary across all V-heads.
 
-    All inputs are f32, shape [C_actual, ...] where C_actual <= C.
-    Returns: (w_bar, u_tilde, k_fwd, gamma_vec, gamma_C)
+    k_chunk: [H, C_actual, d_k] f32 (H = NUM_V_HEADS, expanded via GVA)
+    v_chunk: [H, C_actual, d_v] f32
+    alpha: [H, C_actual] f32
+    beta: [H, C_actual] f32
+    Returns: (W_bar, U_tilde, K_fwd, gamma_vec, gamma_C) batched over H
     """
-    C_actual = k_chunk.shape[0]
+    H, C_actual, d = k_chunk.shape
     device = k_chunk.device
 
-    gamma_vec = torch.cumprod(alpha[:C_actual], dim=0)
-    gamma_C = gamma_vec[-1] if C_actual > 0 else torch.ones(1, device=device, dtype=torch.float32)
+    gamma_vec = torch.cumprod(alpha, dim=1)
+    gamma_C = gamma_vec[:, -1]
 
-    bk = beta[:C_actual, None] * k_chunk
-    bv = beta[:C_actual, None] * v_chunk
-    gram = k_chunk @ k_chunk.T
-    L = torch.tril(beta[:C_actual, None] * gram, diagonal=-1)
+    bk = beta.unsqueeze(-1) * k_chunk
+    bv = beta.unsqueeze(-1) * v_chunk
+    gram = torch.bmm(k_chunk, k_chunk.transpose(1, 2))
+    L = torch.tril(beta.unsqueeze(-1) * gram, diagonal=-1)
 
-    eye = torch.eye(C_actual, device=device, dtype=torch.float32)
-    A = eye.clone()
+    eye = torch.eye(C_actual, device=device, dtype=torch.float32).unsqueeze(0)
+    A = eye.expand(H, -1, -1).clone()
     for _ in range(C_actual - 1):
-        A = eye - L @ A
+        A = eye - torch.bmm(L, A)
 
-    W = A @ bk
-    rhs_u = (1.0 / gamma_vec[:, None]) * bv
-    temp = A @ rhs_u
-    U_tilde = gamma_vec[:, None] * temp
+    W = torch.bmm(A, bk)
+    rhs_u = (1.0 / gamma_vec.unsqueeze(-1)) * bv
+    temp = torch.bmm(A, rhs_u)
+    U_tilde = gamma_vec.unsqueeze(-1) * temp
 
-    W_bar = gamma_vec[:, None] * W
-    K_fwd = (gamma_C / gamma_vec)[:, None] * k_chunk
+    W_bar = gamma_vec.unsqueeze(-1) * W
+    K_fwd = (gamma_C.unsqueeze(-1) / gamma_vec).unsqueeze(-1) * k_chunk
 
     return W_bar, U_tilde, K_fwd, gamma_vec, gamma_C
 
@@ -88,12 +88,11 @@ def _launch_chunked(
     output_tensor: torch.Tensor,
     new_state_tensor: torch.Tensor,
 ):
-    """Chunkwise GDN prefill: 3-phase algorithm using PyTorch ops."""
+    """Chunkwise GDN prefill: batched across all V-heads using PyTorch ops."""
     num_seqs = int(cu_seqlens.numel() - 1)
     C = CHUNK_SIZE
-    d_k = HEAD_DIM
-    d_v = HEAD_DIM
     device = q.device
+    H = NUM_V_HEADS
 
     for seq_idx in range(num_seqs):
         seq_start = int(cu_seqlens[seq_idx].item())
@@ -104,50 +103,51 @@ def _launch_chunked(
             continue
 
         num_chunks = (seq_len + C - 1) // C
+        S = state_tensor[seq_idx].float()
 
-        for h in range(NUM_V_HEADS):
-            qk_h = h // GVA_RATIO
-            A_log_val = A_log[h].float()
-            dt_bias_val = dt_bias[h].float()
+        for chunk_idx in range(num_chunks):
+            t_start = seq_start + chunk_idx * C
+            t_end = min(seq_start + (chunk_idx + 1) * C, seq_end)
+            C_actual = t_end - t_start
 
-            S = state_tensor[seq_idx, h].float()
+            q_qk = q[t_start:t_end].float()
+            k_qk = k[t_start:t_end].float()
+            v_all = v[t_start:t_end].float()
+            a_all = a[t_start:t_end].float()
+            b_all = b[t_start:t_end].float()
 
-            for chunk_idx in range(num_chunks):
-                t_start = seq_start + chunk_idx * C
-                t_end = min(seq_start + (chunk_idx + 1) * C, seq_end)
-                C_actual = t_end - t_start
+            k_exp = k_qk.repeat_interleave(GVA_RATIO, dim=1)
+            q_exp = q_qk.repeat_interleave(GVA_RATIO, dim=1)
 
-                k_c = k[t_start:t_end, qk_h, :].float()
-                v_c = v[t_start:t_end, h, :].float()
-                q_c = q[t_start:t_end, qk_h, :].float()
-                a_c = a[t_start:t_end, h].float()
-                b_c = b[t_start:t_end, h].float()
+            k_h = k_exp.permute(1, 0, 2)
+            v_h = v_all.permute(1, 0, 2)
+            q_h = q_exp.permute(1, 0, 2)
 
-                x = a_c + dt_bias_val
-                softplus_x = torch.where(x > 20.0, x, torch.log(1.0 + torch.exp(x)))
-                alpha_c = torch.exp(-torch.exp(A_log_val) * softplus_x)
-                beta_c = torch.sigmoid(b_c)
+            x = a_all.T.float() + dt_bias.float().unsqueeze(-1)
+            softplus_x = torch.where(x > 20.0, x, torch.log(1.0 + torch.exp(x)))
+            alpha_h = torch.exp(-torch.exp(A_log.float().unsqueeze(-1)) * softplus_x)
+            beta_h = torch.sigmoid(b_all.T.float())
 
-                W_bar, U_tilde, K_fwd, gamma_vec, gamma_C = _chunk_summary(
-                    k_c, v_c, alpha_c, beta_c, C, d_k, d_v,
-                )
+            W_bar, U_tilde, K_fwd, gamma_vec, gamma_C = _chunk_summary_batched(
+                k_h, v_h, alpha_h, beta_h,
+            )
 
-                Q_bar = gamma_vec[:, None] * q_c
+            Q_bar = gamma_vec.unsqueeze(-1) * q_h
+            Delta = U_tilde - torch.bmm(W_bar, S)
+            O_state = torch.bmm(Q_bar, S)
+            QK = torch.bmm(q_h, k_h.transpose(1, 2))
+            mask = torch.tril(torch.ones(C_actual, C_actual, device=device, dtype=torch.float32))
+            gamma_ratio = gamma_vec.unsqueeze(-1) / gamma_vec.unsqueeze(-2)
+            QK_masked = QK * mask.unsqueeze(0) * gamma_ratio
+            O_intra = torch.bmm(QK_masked, Delta)
+            O_chunk = scale * (O_state + O_intra)
 
-                Delta = U_tilde - W_bar @ S
-                O_state = Q_bar @ S
-                QK = q_c @ k_c.T
-                mask = torch.tril(torch.ones(C_actual, C_actual, device=device, dtype=torch.float32))
-                gamma_ratio = gamma_vec[:, None] / gamma_vec[None, :]
-                QK_masked = QK * mask * gamma_ratio
-                O_intra = QK_masked @ Delta
-                O_chunk = scale * (O_state + O_intra)
+            O_out = O_chunk.permute(1, 0, 2).to(torch.bfloat16)
+            output_tensor[t_start:t_end] = O_out
 
-                output_tensor[t_start:t_end, h, :] = O_chunk.to(torch.bfloat16)
+            S = gamma_C.unsqueeze(-1).unsqueeze(-1) * S + torch.bmm(Delta.transpose(1, 2), K_fwd)
 
-                S = gamma_C * S + Delta.T @ K_fwd
-
-            new_state_tensor[seq_idx, h] = S
+        new_state_tensor[seq_idx] = S
 
 
 @register_func("flashinfer.kernel")

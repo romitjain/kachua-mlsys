@@ -27,6 +27,128 @@ STARVED_BV: int = 2
 STARVED_NUM_WARPS: int = 1
 STARVED_NUM_STAGES: int = 2
 
+CHUNK_SIZE: int = 64
+CHUNK_THRESHOLD: int = 128
+
+import torch.nn.functional as F
+
+
+def _chunk_summary(
+    k_chunk: torch.Tensor,
+    v_chunk: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    C: int,
+    d_k: int,
+    d_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute per-chunk summary tensors for the chunkwise GDN decomposition.
+
+    All inputs are f32, shape [C_actual, ...] where C_actual <= C.
+    Returns: (w_bar, u_tilde, k_fwd, gamma_vec, gamma_C)
+    """
+    C_actual = k_chunk.shape[0]
+    device = k_chunk.device
+
+    gamma_vec = torch.cumprod(alpha[:C_actual], dim=0)
+    gamma_C = gamma_vec[-1] if C_actual > 0 else torch.ones(1, device=device, dtype=torch.float32)
+
+    bk = beta[:C_actual, None] * k_chunk
+    bv = beta[:C_actual, None] * v_chunk
+    gram = k_chunk @ k_chunk.T
+    L = torch.tril(beta[:C_actual, None] * gram, diagonal=-1)
+
+    eye = torch.eye(C_actual, device=device, dtype=torch.float32)
+    A = eye.clone()
+    for _ in range(C_actual - 1):
+        A = eye - L @ A
+
+    W = A @ bk
+    rhs_u = (1.0 / gamma_vec[:, None]) * bv
+    temp = A @ rhs_u
+    U_tilde = gamma_vec[:, None] * temp
+
+    W_bar = gamma_vec[:, None] * W
+    K_fwd = (gamma_C / gamma_vec)[:, None] * k_chunk
+
+    return W_bar, U_tilde, K_fwd, gamma_vec, gamma_C
+
+
+def _launch_chunked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_tensor: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    output_tensor: torch.Tensor,
+    new_state_tensor: torch.Tensor,
+):
+    """Chunkwise GDN prefill: 3-phase algorithm using PyTorch ops."""
+    num_seqs = int(cu_seqlens.numel() - 1)
+    C = CHUNK_SIZE
+    d_k = HEAD_DIM
+    d_v = HEAD_DIM
+    device = q.device
+
+    for seq_idx in range(num_seqs):
+        seq_start = int(cu_seqlens[seq_idx].item())
+        seq_end = int(cu_seqlens[seq_idx + 1].item())
+        seq_len = seq_end - seq_start
+        if seq_len <= 0:
+            new_state_tensor[seq_idx] = state_tensor[seq_idx]
+            continue
+
+        num_chunks = (seq_len + C - 1) // C
+
+        for h in range(NUM_V_HEADS):
+            qk_h = h // GVA_RATIO
+            A_log_val = A_log[h].float()
+            dt_bias_val = dt_bias[h].float()
+
+            S = state_tensor[seq_idx, h].float()
+
+            for chunk_idx in range(num_chunks):
+                t_start = seq_start + chunk_idx * C
+                t_end = min(seq_start + (chunk_idx + 1) * C, seq_end)
+                C_actual = t_end - t_start
+
+                k_c = k[t_start:t_end, qk_h, :].float()
+                v_c = v[t_start:t_end, h, :].float()
+                q_c = q[t_start:t_end, qk_h, :].float()
+                a_c = a[t_start:t_end, h].float()
+                b_c = b[t_start:t_end, h].float()
+
+                x = a_c + dt_bias_val
+                softplus_x = torch.where(x > 20.0, x, torch.log(1.0 + torch.exp(x)))
+                alpha_c = torch.exp(-torch.exp(A_log_val) * softplus_x)
+                beta_c = torch.sigmoid(b_c)
+
+                W_bar, U_tilde, K_fwd, gamma_vec, gamma_C = _chunk_summary(
+                    k_c, v_c, alpha_c, beta_c, C, d_k, d_v,
+                )
+
+                Q_bar = gamma_vec[:, None] * q_c
+
+                Delta = U_tilde - W_bar @ S
+                O_state = Q_bar @ S
+                QK = q_c @ k_c.T
+                mask = torch.tril(torch.ones(C_actual, C_actual, device=device, dtype=torch.float32))
+                gamma_ratio = gamma_vec[:, None] / gamma_vec[None, :]
+                QK_masked = QK * mask * gamma_ratio
+                O_intra = QK_masked @ Delta
+                O_chunk = scale * (O_state + O_intra)
+
+                output_tensor[t_start:t_end, h, :] = O_chunk.to(torch.bfloat16)
+
+                S = gamma_C * S + Delta.T @ K_fwd
+
+            new_state_tensor[seq_idx, h] = S
+
 
 @register_func("flashinfer.kernel")
 def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, new_state):
@@ -44,18 +166,6 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
     num_seqs = int(cu_seqlens.numel() - 1)
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(HEAD_DIM)
-    avg_seq_len = max(1, (q.shape[0] + num_seqs - 1) // num_seqs)
-
-    if num_seqs == 1 and avg_seq_len >= 512:
-        kernel = gdn_prefill_kernel_long
-        bv, num_warps, num_stages = STARVED_BV, STARVED_NUM_WARPS, STARVED_NUM_STAGES
-    elif num_seqs <= 2 and avg_seq_len >= 256:
-        kernel = gdn_prefill_kernel_long
-        bv, num_warps, num_stages = LONG_BV, LONG_NUM_WARPS, LONG_NUM_STAGES
-    else:
-        kernel = gdn_prefill_kernel
-        bv, num_warps, num_stages = BALANCED_BV, BALANCED_NUM_WARPS, BALANCED_NUM_STAGES
-    n_v_tiles = HEAD_DIM // bv
 
     if output is None:
         output_tensor = torch.empty(
@@ -77,6 +187,26 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
 
     if state_tensor is None:
         state_tensor = torch.zeros_like(new_state_tensor)
+
+    avg_seq_len = max(1, (q.shape[0] + num_seqs - 1) // num_seqs)
+
+    if avg_seq_len >= CHUNK_THRESHOLD:
+        _launch_chunked(
+            q, k, v, state_tensor, A_log, a, dt_bias, b,
+            cu_seqlens, scale, output_tensor, new_state_tensor,
+        )
+        return output_tensor, new_state_tensor
+
+    if num_seqs == 1 and avg_seq_len >= 512:
+        kernel = gdn_prefill_kernel_long
+        bv, num_warps, num_stages = STARVED_BV, STARVED_NUM_WARPS, STARVED_NUM_STAGES
+    elif num_seqs <= 2 and avg_seq_len >= 256:
+        kernel = gdn_prefill_kernel_long
+        bv, num_warps, num_stages = LONG_BV, LONG_NUM_WARPS, LONG_NUM_STAGES
+    else:
+        kernel = gdn_prefill_kernel
+        bv, num_warps, num_stages = BALANCED_BV, BALANCED_NUM_WARPS, BALANCED_NUM_STAGES
+    n_v_tiles = HEAD_DIM // bv
 
     grid = (num_seqs, NUM_V_HEADS * n_v_tiles)
     kernel[grid](

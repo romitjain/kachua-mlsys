@@ -14,26 +14,18 @@ NUM_K_HEADS: int = 4
 NUM_V_HEADS: int = 8
 HEAD_DIM: int = 128
 GVA_RATIO: int = NUM_V_HEADS // NUM_Q_HEADS
-BALANCED_VARIANT = "balanced"
-LONG_VARIANT = "long"
-
 BALANCED_BV: int = 8
 BALANCED_NUM_WARPS: int = 8
+BALANCED_NUM_STAGES: int = 4
+MICRO_BV: int = 8
+MICRO_NUM_WARPS: int = 4
+MICRO_NUM_STAGES: int = 2
 LONG_BV: int = 4
 LONG_NUM_WARPS: int = 1
-
-LONG_NUM_SEQS_THRESHOLD: int = 2
-LONG_AVG_SEQ_THRESHOLD: int = 256
-
-
-def _select_kernel_variant(total_tokens: int, num_seqs: int) -> str:
-    if num_seqs < 1:
-        raise ValueError(f"num_seqs must be >= 1, got {num_seqs}")
-
-    avg_seq_len = max(1, (total_tokens + num_seqs - 1) // num_seqs)
-    if num_seqs <= LONG_NUM_SEQS_THRESHOLD and avg_seq_len >= LONG_AVG_SEQ_THRESHOLD:
-        return LONG_VARIANT
-    return BALANCED_VARIANT
+LONG_NUM_STAGES: int = 4
+STARVED_BV: int = 2
+STARVED_NUM_WARPS: int = 1
+STARVED_NUM_STAGES: int = 2
 
 
 @register_func("flashinfer.kernel")
@@ -53,14 +45,16 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(HEAD_DIM)
     avg_seq_len = max(1, (q.shape[0] + num_seqs - 1) // num_seqs)
-    if num_seqs <= LONG_NUM_SEQS_THRESHOLD and avg_seq_len >= LONG_AVG_SEQ_THRESHOLD:
+
+    if num_seqs == 1 and avg_seq_len >= 512:
         kernel = gdn_prefill_kernel_long
-        bv = LONG_BV
-        num_warps = LONG_NUM_WARPS
+        bv, num_warps, num_stages = STARVED_BV, STARVED_NUM_WARPS, STARVED_NUM_STAGES
+    elif num_seqs <= 2 and avg_seq_len >= 256:
+        kernel = gdn_prefill_kernel_long
+        bv, num_warps, num_stages = LONG_BV, LONG_NUM_WARPS, LONG_NUM_STAGES
     else:
         kernel = gdn_prefill_kernel
-        bv = BALANCED_BV
-        num_warps = BALANCED_NUM_WARPS
+        bv, num_warps, num_stages = BALANCED_BV, BALANCED_NUM_WARPS, BALANCED_NUM_STAGES
     n_v_tiles = HEAD_DIM // bv
 
     if output is None:
@@ -106,7 +100,7 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
         BV=bv,
         N_V_TILES=n_v_tiles,
         num_warps=num_warps,
-        num_stages=4,
+        num_stages=num_stages,
     )
     return output_tensor, new_state_tensor
 
@@ -188,23 +182,24 @@ def gdn_prefill_kernel(
 
 
 @triton.jit
-def _prefill_update_tile(
-    state_tile,
-    b_q,
-    b_k,
-    b_v,
-    g,
-    beta,
-    scale,
+def _prefill_update_tile_pair(
+    state0, state1, b_q, b_k, b_v0, b_v1, g, beta, scale,
 ):
-    old_state = g * state_tile
-    old_v = tl.sum(old_state * b_k[None, :], axis=1)
-    delta_v = beta * (b_v - old_v)
-    old_o = tl.sum(old_state * b_q[None, :], axis=1)
+    """Fused update for two state half-tiles, computing kq once."""
+    old_state0 = g * state0
+    old_state1 = g * state1
+    old_v0 = tl.sum(old_state0 * b_k[None, :], axis=1)
+    old_v1 = tl.sum(old_state1 * b_k[None, :], axis=1)
+    delta_v0 = beta * (b_v0 - old_v0)
+    delta_v1 = beta * (b_v1 - old_v1)
     kq = tl.sum(b_k * b_q)
-    b_o = scale * (old_o + delta_v * kq)
-    state_out = old_state + delta_v[:, None] * b_k[None, :]
-    return b_o, state_out
+    old_o0 = tl.sum(old_state0 * b_q[None, :], axis=1)
+    old_o1 = tl.sum(old_state1 * b_q[None, :], axis=1)
+    out0 = scale * (old_o0 + delta_v0 * kq)
+    out1 = scale * (old_o1 + delta_v1 * kq)
+    new_state0 = old_state0 + delta_v0[:, None] * b_k[None, :]
+    new_state1 = old_state1 + delta_v1[:, None] * b_k[None, :]
+    return out0, out1, new_state0, new_state1
 
 
 @triton.jit
@@ -349,19 +344,12 @@ def gdn_prefill_kernel_long(
             PAIR_ROWS=BV // 2,
         )
 
-        out0, state_tile0 = _prefill_update_tile(
+        out0, out1, state_tile0, state_tile1 = _prefill_update_tile_pair(
             state_tile0,
-            curr_q,
-            curr_k,
-            curr_v0,
-            curr_g,
-            curr_beta,
-            scale,
-        )
-        out1, state_tile1 = _prefill_update_tile(
             state_tile1,
             curr_q,
             curr_k,
+            curr_v0,
             curr_v1,
             curr_g,
             curr_beta,

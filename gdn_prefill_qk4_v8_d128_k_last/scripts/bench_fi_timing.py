@@ -88,40 +88,73 @@ def load_kernel() -> tuple[str, str, Callable]:
     language = config["build"]["language"]
     binding = config["build"].get("binding")
 
-    if language != "triton":
-        raise NotImplementedError(
-            f"This prefill workspace only supports language='triton', got {language!r}."
-        )
+    if language == "cuda" and binding == "torch":
+        import solution.cuda.binding as binding_module
 
-    import importlib.util
+        def kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale=None):
+            T = q.shape[0]
+            num_v_heads = v.shape[1]
+            V = v.shape[2]
+            K = k.shape[2]
+            num_seqs = int(cu_seqlens.numel() - 1)
 
-    entry_file, entry_function = config["build"]["entry_point"].split("::", maxsplit=1)
-    kernel_path = PROJECT_ROOT / "solution" / "triton" / entry_file
-    mod_name = "triton_kernel"
-    if mod_name in sys.modules:
-        mod = sys.modules[mod_name]
-    else:
-        spec = importlib.util.spec_from_file_location(mod_name, str(kernel_path))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[mod_name] = mod
-        spec.loader.exec_module(mod)
-    entry_fn = getattr(mod, entry_function)
+            if scale is None or scale == 0:
+                scale_ = 1.0 / math.sqrt(K)
+            else:
+                scale_ = float(scale)
 
-    def triton_kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale=None):
-        T = q.shape[0]
-        num_v_heads = v.shape[1]
-        V = v.shape[2]
-        K = k.shape[2]
-        num_seqs = int(cu_seqlens.numel() - 1)
-        scale_ = 1.0 / math.sqrt(K) if scale is None or scale == 0 else float(scale)
-        out = torch.empty((T, num_v_heads, V), dtype=torch.bfloat16, device=q.device)
-        new_state = torch.empty(
-            (num_seqs, num_v_heads, V, K), dtype=torch.float32, device=q.device,
-        )
-        entry_fn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_, out, new_state)
-        return out, new_state
+            state_ = state
+            if state_ is None:
+                state_ = torch.zeros(
+                    (num_seqs, num_v_heads, V, K),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
 
-    return solution_name, definition_name, triton_kernel
+            out = torch.empty((T, num_v_heads, V), dtype=torch.bfloat16, device=q.device)
+            new_state = torch.empty_like(state_)
+
+            ext = binding_module._load_extension()
+            ext.launch_gdn(q, k, v, state_, A_log, a, dt_bias, b, cu_seqlens, scale_, out, new_state)
+            return out, new_state
+
+        return solution_name, definition_name, kernel
+
+    if language == "triton":
+        import importlib.util
+
+        entry_file, entry_function = config["build"]["entry_point"].split("::", maxsplit=1)
+        kernel_path = PROJECT_ROOT / "solution" / "triton" / entry_file
+        mod_name = "triton_kernel"
+        if mod_name in sys.modules:
+            mod = sys.modules[mod_name]
+        else:
+            spec = importlib.util.spec_from_file_location(mod_name, str(kernel_path))
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = mod
+            spec.loader.exec_module(mod)
+        entry_fn = getattr(mod, entry_function)
+
+        def kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale=None):
+            T = q.shape[0]
+            num_v_heads = v.shape[1]
+            V = v.shape[2]
+            K = k.shape[2]
+            num_seqs = int(cu_seqlens.numel() - 1)
+            scale_ = 1.0 / math.sqrt(K) if scale is None or scale == 0 else float(scale)
+            out = torch.empty((T, num_v_heads, V), dtype=torch.bfloat16, device=q.device)
+            new_state = torch.empty(
+                (num_seqs, num_v_heads, V, K), dtype=torch.float32, device=q.device,
+            )
+            entry_fn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale_, out, new_state)
+            return out, new_state
+
+        return solution_name, definition_name, kernel
+
+    raise NotImplementedError(
+        f"bench_fi_timing.py supports prefill CUDA torch bindings and Triton, got "
+        f"language={language!r}, binding={binding!r}."
+    )
 
 
 def _dtype_from_name(dtype_name: str) -> torch.dtype:

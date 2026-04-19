@@ -280,6 +280,11 @@ def check_correctness(
         ref_out = (ref_out,)
         kernel_out = (kernel_out,)
 
+    assert len(ref_out) == len(kernel_out), (
+        f"Output arity mismatch: kernel returned {len(kernel_out)} tensor(s) "
+        f"but reference returned {len(ref_out)}; zip would silently hide missing outputs."
+    )
+
     per_output = {}
     names = ("output", "new_state", *(f"out_{i}" for i in range(2, len(ref_out))))
     max_abs_all = 0.0

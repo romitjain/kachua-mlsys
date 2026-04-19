@@ -303,7 +303,12 @@ def gdn_prefill_kernel_v2(
         state_k = _safe_dot_bf16(K_tile_bf, state_tile_bf_T)                    # [C, BV]
 
         nil = tl.where(lower, gram_kk * beta_chunk[:, None], 0.0)
-        rhs = beta_chunk[:, None] * (V_tile / G[:, None] - state_k)
+        # Clamp the divisor: G = exp2(cumsum(log2_g)) can underflow to 0 in fp32
+        # for strong-decay workloads on CHUNK=32 (per-step g ~ exp(-5)+).
+        # The downstream G multiplier at out_tile is left unclamped so that if
+        # G is truly ~0, the gated contribution collapses to 0 rather than NaN.
+        G_safe = tl.maximum(G, 1e-30)
+        rhs = beta_chunk[:, None] * (V_tile / G_safe[:, None] - state_k)
         x_chunk = _apply_unit_lower_inverse(nil, rhs, BV=BV, CHUNK=CHUNK)      # [C, BV]
         x_chunk = tl.where(active[:, None], x_chunk, 0.0)
 

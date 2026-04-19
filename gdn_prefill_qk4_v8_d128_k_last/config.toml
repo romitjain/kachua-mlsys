@@ -1,5 +1,5 @@
 [solution]
-name = "gdn-prefill-triton-v1"
+name = "gdn-prefill-triton-v2"
 definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "kachua"
 

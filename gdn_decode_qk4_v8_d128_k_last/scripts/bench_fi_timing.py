@@ -228,6 +228,75 @@ def load_workload_tensors(
     return tensors, input_names
 
 
+CORRECTNESS_ATOL = 1e-2
+CORRECTNESS_RTOL = 1e-2
+
+
+def _clone_for_call(call_args):
+    cloned = []
+    for arg in call_args:
+        if isinstance(arg, torch.Tensor):
+            cloned.append(arg.clone())
+        else:
+            cloned.append(arg)
+    return tuple(cloned)
+
+
+def _tensor_errors(ref: torch.Tensor, actual: torch.Tensor) -> tuple[float, float]:
+    ref_f = ref.detach().float()
+    actual_f = actual.detach().float()
+    abs_err = (actual_f - ref_f).abs()
+    max_abs = float(abs_err.max().item())
+    denom = ref_f.abs().clamp_min(1e-12)
+    max_rel = float((abs_err / denom).max().item())
+    return max_abs, max_rel
+
+
+def check_correctness(
+    kernel_fn: Callable,
+    call_args: tuple,
+    *,
+    atol: float = CORRECTNESS_ATOL,
+    rtol: float = CORRECTNESS_RTOL,
+) -> dict:
+    """Run the kernel and reference once; return max_abs/max_rel errors per output."""
+    import solution.reference_torch_impl as reference_module
+
+    kernel_out = kernel_fn(*_clone_for_call(call_args))
+    ref_out = reference_module.run(*_clone_for_call(call_args))
+    torch.cuda.synchronize()
+
+    if isinstance(ref_out, torch.Tensor):
+        ref_out = (ref_out,)
+        kernel_out = (kernel_out,)
+
+    per_output = {}
+    names = ("output", "new_state", *(f"out_{i}" for i in range(2, len(ref_out))))
+    max_abs_all = 0.0
+    max_rel_all = 0.0
+    within_tol_all = True
+    for name, ref_t, k_t in zip(names, ref_out, kernel_out):
+        max_abs, max_rel = _tensor_errors(ref_t, k_t)
+        within = max_abs <= atol + rtol * float(ref_t.detach().float().abs().max().item())
+        per_output[name] = {
+            "max_abs_error": max_abs,
+            "max_rel_error": max_rel,
+            "within_tolerance": within,
+        }
+        max_abs_all = max(max_abs_all, max_abs)
+        max_rel_all = max(max_rel_all, max_rel)
+        within_tol_all = within_tol_all and within
+
+    return {
+        "max_abs_error": max_abs_all,
+        "max_rel_error": max_rel_all,
+        "within_tolerance": within_tol_all,
+        "atol": atol,
+        "rtol": rtol,
+        "per_output": per_output,
+    }
+
+
 def run_benchmark(
     *,
     workload_idx: int = 0,
@@ -248,6 +317,8 @@ def run_benchmark(
 
     kernel(*call_args)
     torch.cuda.synchronize()
+
+    correctness = check_correctness(kernel, call_args)
 
     timing_backend = "cupti"
     try:
@@ -285,12 +356,24 @@ def run_benchmark(
         "min_us": min(times_us),
         "max_us": max(times_us),
         "iters": len(times_us),
+        "correctness": correctness,
     }
 
     print("===" * 10)
     print(f"Workload index: {workload_idx}")
     print(f"Solution: {solution_name}")
     print(f"Definition: {definition_name}")
+    tol_tag = "OK" if correctness["within_tolerance"] else "OUT-OF-TOL"
+    print(
+        f"Correctness [{tol_tag}]: max_abs_error={correctness['max_abs_error']:.3e} "
+        f"max_rel_error={correctness['max_rel_error']:.3e} "
+        f"(atol={correctness['atol']}, rtol={correctness['rtol']})"
+    )
+    for out_name, err in correctness["per_output"].items():
+        marker = "ok" if err["within_tolerance"] else "OUT"
+        print(
+            f"  [{marker}] {out_name}: abs={err['max_abs_error']:.3e} rel={err['max_rel_error']:.3e}"
+        )
     print(
         f"{solution_name} [{timing_backend}]: mean={result['mean_us']:.2f} median={result['median_us']:.2f} us "
         f"(min={result['min_us']:.2f} us, max={result['max_us']:.2f} us, n={result['iters']})"

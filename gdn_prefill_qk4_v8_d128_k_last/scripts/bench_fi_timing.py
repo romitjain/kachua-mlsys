@@ -292,7 +292,7 @@ def check_correctness(
     within_tol_all = True
     for name, ref_t, k_t in zip(names, ref_out, kernel_out):
         max_abs, max_rel = _tensor_errors(ref_t, k_t)
-        within = max_abs <= atol + rtol * float(ref_t.detach().float().abs().max().item())
+        within = torch.allclose(k_t.float(), ref_t.float(), atol=atol, rtol=rtol)
         per_output[name] = {
             "max_abs_error": max_abs,
             "max_rel_error": max_rel,

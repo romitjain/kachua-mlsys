@@ -114,7 +114,7 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
     chunk = 32 if (num_seqs <= 3 and avg_seq_len >= 512) else 16
 
     grid = (num_seqs, NUM_V_HEADS * n_v_tiles)
-    gdn_prefill_kernel_chunk[grid](
+    gdn_prefill_kernel_v2[grid](
         q, k, v, state_tensor, A_log, a, dt_bias, b, cu_seqlens,
         output_tensor, new_state_tensor, scale, seq_bucket,
         K=HEAD_DIM, V_DIM=HEAD_DIM,
@@ -125,7 +125,7 @@ def launch_gdn(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, 
 
 
 # ---------------------------------------------------------------------------
-# Chunkwise matmul-based kernel (C=32)
+# v2 chunkwise matmul-based kernel (adaptive C=16/32)
 #
 # Exact algebra for one chunk of C tokens, state kept in [V, K]:
 #   G_j = prod_{i<=j} g_i, G_c = G_{C-1}
@@ -221,7 +221,7 @@ def _apply_unit_lower_inverse(nil, rhs, BV: tl.constexpr, CHUNK: tl.constexpr):
     key=["BV", "seq_bucket"],
 )
 @triton.jit
-def gdn_prefill_kernel_chunk(
+def gdn_prefill_kernel_v2(
     q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
     cu_seqlens_ptr, out_ptr, new_state_ptr, scale, seq_bucket,
     K: tl.constexpr, V_DIM: tl.constexpr,
@@ -322,115 +322,6 @@ def gdn_prefill_kernel_chunk(
         state_tile = Gc * (state_tile + _safe_dot_bf16(tl.trans(x_chunk_bf), K_tile_bf))
 
     tl.store(ns_ptrs, state_tile)
-
-
-# ---------------------------------------------------------------------------
-# v3 scalar fallback (kept intact for very short / many-sequence workloads)
-# ---------------------------------------------------------------------------
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=4),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=4),
-    ],
-    key=["BV", "seq_bucket"],
-)
-@triton.jit
-def gdn_prefill_kernel_v3(
-    q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
-    cu_seqlens_ptr, out_ptr, new_state_ptr, scale, seq_bucket,
-    K: tl.constexpr, V_DIM: tl.constexpr,
-    NUM_V_HEADS: tl.constexpr, NUM_K_HEADS: tl.constexpr, GVA_RATIO: tl.constexpr,
-    BV: tl.constexpr, N_V_TILES: tl.constexpr,
-):
-    pid_seq = tl.program_id(0)
-    pid_hv = tl.program_id(1)
-    pid_h = pid_hv // N_V_TILES
-    pid_v = pid_hv % N_V_TILES
-    qk_head = pid_h // GVA_RATIO
-
-    seq_start = tl.load(cu_seqlens_ptr + pid_seq).to(tl.int32)
-    seq_end = tl.load(cu_seqlens_ptr + pid_seq + 1).to(tl.int32)
-    o_k = tl.arange(0, K)
-    o_v = tl.arange(0, BV)
-    v_start = pid_v * BV
-
-    s_base = state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
-    s_ptrs = s_base + o_v[:, None] * K + o_k[None, :]
-    state_tile = tl.load(s_ptrs).to(tl.float32)
-
-    ns_base = new_state_ptr + (pid_seq * NUM_V_HEADS + pid_h) * V_DIM * K + v_start * K
-    ns_ptrs = ns_base + o_v[:, None] * K + o_k[None, :]
-    if seq_end <= seq_start:
-        tl.store(ns_ptrs, state_tile)
-        return
-
-    A_log_val = tl.load(A_log_ptr + pid_h).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
-    neg_exp_A = -tl.exp(A_log_val)
-
-    curr_g, curr_beta, curr_q, curr_k, curr_v = _load_token_v3(
-        seq_start, seq_end, pid_h, qk_head, q_ptr, k_ptr, v_ptr, a_ptr, b_ptr,
-        neg_exp_A, dt_bias_val, o_k, o_v, v_start,
-        K=K, V_DIM=V_DIM, NUM_V_HEADS=NUM_V_HEADS, NUM_K_HEADS=NUM_K_HEADS, BV=BV,
-    )
-
-    for token_idx in tl.range(seq_start, seq_end):
-        next_token = token_idx + 1
-        next_g, next_beta, next_q, next_k, next_v = _load_token_v3(
-            next_token, seq_end, pid_h, qk_head, q_ptr, k_ptr, v_ptr, a_ptr, b_ptr,
-            neg_exp_A, dt_bias_val, o_k, o_v, v_start,
-            K=K, V_DIM=V_DIM, NUM_V_HEADS=NUM_V_HEADS, NUM_K_HEADS=NUM_K_HEADS, BV=BV,
-        )
-
-        old_state = curr_g * state_tile
-        old_v = tl.sum(old_state * curr_k[None, :], axis=1)
-        delta_v = curr_beta * (curr_v - old_v)
-        old_o = tl.sum(old_state * curr_q[None, :], axis=1)
-        kq = tl.sum(curr_k * curr_q)
-        out_val = scale * (old_o + delta_v * kq)
-
-        out_base = out_ptr + token_idx * NUM_V_HEADS * V_DIM + pid_h * V_DIM + v_start
-        tl.store(out_base + o_v, out_val.to(tl.bfloat16))
-
-        state_tile = old_state + delta_v[:, None] * curr_k[None, :]
-        curr_g = next_g
-        curr_beta = next_beta
-        curr_q = next_q
-        curr_k = next_k
-        curr_v = next_v
-
-    tl.store(ns_ptrs, state_tile)
-
-
-@triton.jit
-def _load_token_v3(
-    token_idx, seq_end, pid_h, qk_head,
-    q_ptr, k_ptr, v_ptr, a_ptr, b_ptr,
-    neg_exp_A, dt_bias_val, o_k, o_v, v_start,
-    K: tl.constexpr, V_DIM: tl.constexpr,
-    NUM_V_HEADS: tl.constexpr, NUM_K_HEADS: tl.constexpr, BV: tl.constexpr,
-):
-    active = token_idx < seq_end
-    gate_index = token_idx * NUM_V_HEADS + pid_h
-    a_val = tl.load(a_ptr + gate_index, mask=active, other=0.0).to(tl.float32)
-    x = a_val + dt_bias_val
-    softplus_x = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
-    g = tl.where(active, tl.exp(neg_exp_A * softplus_x), 0.0)
-    beta = tl.sigmoid(tl.load(b_ptr + gate_index, mask=active, other=0.0).to(tl.float32))
-
-    qk_base = token_idx * NUM_K_HEADS * K + qk_head * K
-    q_vec = tl.load(q_ptr + qk_base + o_k, mask=active, other=0.0).to(tl.float32)
-    k_vec = tl.load(k_ptr + qk_base + o_k, mask=active, other=0.0).to(tl.float32)
-
-    v_base = token_idx * NUM_V_HEADS * V_DIM + pid_h * V_DIM + v_start
-    v_vec = tl.load(v_ptr + v_base + o_v, mask=active, other=0.0).to(tl.float32)
-    return g, beta, q_vec, k_vec, v_vec
 
 
 # ---------------------------------------------------------------------------

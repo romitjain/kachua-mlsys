@@ -1,8 +1,9 @@
 """
 FlashInfer-Bench Modal Cloud Benchmark Runner.
 
-Automatically packs the solution from source files and runs benchmarks
-on NVIDIA B200 GPUs via Modal.
+Packs and benchmarks on Modal B200 GPUs. All flashinfer_bench imports
+happen on the remote container (Linux + CUDA), so this can be launched
+from macOS via `uv run modal run scripts/run_modal.py`.
 
 Setup (one-time):
     modal setup
@@ -10,15 +11,16 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
-import sys
 from pathlib import Path
 
-# Add project root to path for imports
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+
+PROJECT_ROOT = Path(__file__).parent.parent
 
 app = modal.App("flashinfer-bench")
 
@@ -34,8 +36,10 @@ image = (
         "flashinfer-python",
         "pandas",
         "cupti-python",
+        "nvidia-cutlass",
     )
 )
+
 
 def _is_trace_root(path: Path) -> bool:
     """Return True if path looks like a flashinfer trace-set root."""
@@ -60,10 +64,53 @@ def _resolve_trace_set_path(base_path: str) -> Path:
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+def run_benchmark(config_toml: str, source_files: dict) -> dict:
+    """Pack solution + run benchmark on Modal B200.
+
+    Args:
+        config_toml: Contents of config.toml as a string (parsed on remote).
+        source_files: {relative_path: content} for the active kernel.
+    """
+    import tempfile
+
+    import tomllib as tomllib_remote
+
+    from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
+    from flashinfer_bench.agents import pack_solution_from_files
+
+    config = tomllib_remote.loads(config_toml)
+    build_config = config["build"]
+    solution_config = config["solution"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for fname, content in source_files.items():
+            fpath = Path(tmpdir) / fname
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(content)
+
+        # "cute" uses BuildSpec language="triton" — both are Python modules
+        # that the framework imports (not compiled via nvcc).
+        language = build_config["language"]
+        build_language = "triton" if language == "cute" else language
+
+        spec = BuildSpec(
+            language=build_language,
+            target_hardware=["cuda"],
+            entry_point=build_config["entry_point"],
+            binding=build_config.get("binding"),
+        )
+
+        solution = pack_solution_from_files(
+            path=tmpdir,
+            spec=spec,
+            name=solution_config["name"],
+            definition=solution_config["definition"],
+            author=solution_config["author"],
+        )
+
+    print(f"Packed: {solution.name} ({solution.definition})")
+
+    bench_config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
     trace_set_path = _resolve_trace_set_path(TRACE_SET_PATH)
     trace_set = TraceSet.from_path(trace_set_path)
@@ -89,7 +136,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         traces={definition.name: []},
     )
 
-    benchmark = Benchmark(bench_trace_set, config)
+    benchmark = Benchmark(bench_trace_set, bench_config)
     result_trace_set = benchmark.run_all(dump_traces=True)
 
     traces = result_trace_set.traces.get(definition.name, [])
@@ -110,6 +157,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
 
+    results["_solution_json"] = solution.model_dump_json(indent=2)
     return results
 
 
@@ -135,23 +183,43 @@ def print_results(results: dict):
             print()
 
 
+def _read_source_files(source_dir: Path) -> dict:
+    """Read all text source files, skipping __pycache__ and .pyc."""
+    source_files = {}
+    for f in sorted(source_dir.rglob("*")):
+        if f.is_file() and "__pycache__" not in f.parts and f.suffix != ".pyc":
+            rel = str(f.relative_to(source_dir))
+            source_files[rel] = f.read_text()
+    return source_files
+
+
 @app.local_entrypoint()
 def main():
-    """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+    """Read source files locally, send config + files to Modal for benchmark."""
+    config_path = PROJECT_ROOT / "config.toml"
+    config_toml = config_path.read_text()
+    config = tomllib.loads(config_toml)
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    language = config["build"]["language"]
+    source_dir = PROJECT_ROOT / "solution" / language
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+    source_files = _read_source_files(source_dir)
+    print(f"Read {len(source_files)} files from solution/{language}/")
+    print(f"Entry point: {config['build']['entry_point']}")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    print("\nRunning pack + benchmark on Modal B200...")
+    results = run_benchmark.remote(config_toml, source_files)
 
     if not results:
         print("No results returned!")
         return
+
+    solution_json = results.pop("_solution_json", None)
+    if solution_json:
+        output_path = PROJECT_ROOT / "solution.json"
+        output_path.write_text(solution_json)
+        print(f"\nSolution saved to {output_path}")
 
     print_results(results)

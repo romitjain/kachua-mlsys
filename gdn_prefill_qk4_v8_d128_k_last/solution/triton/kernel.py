@@ -599,7 +599,11 @@ def gdn_prefill_many_wy_prepass_flat(
     seq_end = tl.load(cu_seqlens_ptr + pid_seq + 1).to(tl.int32)
     chunk_start = seq_start + pid_chunk * CHUNK
     if STORE_RECORD_BASE:
-        tl.store(record_base_ptr + pid_seq, record_id, mask=pid_chunk == 0)
+        tl.store(
+            record_base_ptr + pid_seq,
+            record_id,
+            mask=(pid_chunk == 0) & (pid_h == 0),
+        )
     if chunk_start >= seq_end:
         return
 

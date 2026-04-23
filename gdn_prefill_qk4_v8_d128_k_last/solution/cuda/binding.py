@@ -15,6 +15,7 @@ def _load_extension():
             name="kachua_gdn_prefill_cuda_v1",
             sources=[str(Path(__file__).resolve().with_name("kernel.cu"))],
             extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_ldflags=["-lcuda"],
             with_cuda=True,
             verbose=False,
         )

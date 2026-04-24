@@ -51,6 +51,22 @@ __device__ __forceinline__ void warp_reduce_2(float& a, float& b) {
     }
 }
 
+__device__ __forceinline__ void warp_reduce_4(float& a, float& b, float& c, float& d) {
+#pragma unroll
+    for (int off = kWarpSize / 2; off > 0; off >>= 1) {
+        float ta, tb, tc, td;
+        asm volatile(
+            "shfl.sync.bfly.b32 %0, %4, %8, 0x1f, 0xffffffff;\n\t"
+            "shfl.sync.bfly.b32 %1, %5, %8, 0x1f, 0xffffffff;\n\t"
+            "shfl.sync.bfly.b32 %2, %6, %8, 0x1f, 0xffffffff;\n\t"
+            "shfl.sync.bfly.b32 %3, %7, %8, 0x1f, 0xffffffff;"
+            : "=f"(ta), "=f"(tb), "=f"(tc), "=f"(td)
+            : "f"(a), "f"(b), "f"(c), "f"(d), "r"(off)
+        );
+        a += ta; b += tb; c += tc; d += td;
+    }
+}
+
 __global__ void gdn_v1(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ k,
@@ -532,6 +548,292 @@ __global__ __launch_bounds__(kWarpSize, 1) void gdn_v4(
     }
 }
 
+template <int BV>
+__global__ __launch_bounds__(kWarpSize, 1) void gdn_v5(
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const float *__restrict__ state,
+    const float *__restrict__ A_log,
+    const __nv_bfloat16 *__restrict__ a,
+    const float *__restrict__ dt_bias,
+    const __nv_bfloat16 *__restrict__ b,
+    __nv_bfloat16 *__restrict__ out,
+    float *__restrict__ new_state,
+    int B,
+    int num_v_heads,
+    int num_k_heads,
+    int K,
+    int V,
+    float scale
+) {
+    const int i_v = blockIdx.x;
+    const int i_nh = blockIdx.y;
+    const int i_hv = i_nh % kNumVHeads;
+    const int i_h = i_hv / kHeadGroupRatio;
+    const int i_n = i_nh / kNumVHeads;
+    const int tid = threadIdx.x;
+    const int k_base = tid * kKVec;
+    const int state_base = i_nh * kVDim * kHeadSize;
+
+    const float neg_exp_A = -__expf(__ldg(A_log + i_hv));
+    const float gate_x = __bfloat162float(__ldg(a + i_nh)) + __ldg(dt_bias + i_hv);
+    const float exp_gate_x = __expf(gate_x);
+    const float exp_neg_b = __expf(-__bfloat162float(__ldg(b + i_nh)));
+
+    float4 h4[BV];
+#pragma unroll
+    for (int row = 0; row < BV; ++row) {
+        const int v_idx = i_v * BV + row;
+        h4[row] = __ldg(reinterpret_cast<const float4*>(
+            state + state_base + v_idx * kHeadSize + k_base
+        ));
+    }
+
+    float h[BV][kKVec];
+#pragma unroll
+    for (int row = 0; row < BV; ++row) {
+        h[row][0] = h4[row].x;
+        h[row][1] = h4[row].y;
+        h[row][2] = h4[row].z;
+        h[row][3] = h4[row].w;
+    }
+
+    float q_reg[kKVec];
+    float k_reg[kKVec];
+    {
+        const int qk_offset = (i_n * kNumQKHeads + i_h) * kHeadSize + k_base;
+        const uint2 q_raw = __ldg(reinterpret_cast<const uint2*>(q + qk_offset));
+        const uint2 k_raw = __ldg(reinterpret_cast<const uint2*>(k + qk_offset));
+        __nv_bfloat162 q_pair01 = *reinterpret_cast<const __nv_bfloat162*>(&q_raw.x);
+        __nv_bfloat162 q_pair23 = *reinterpret_cast<const __nv_bfloat162*>(&q_raw.y);
+        __nv_bfloat162 k_pair01 = *reinterpret_cast<const __nv_bfloat162*>(&k_raw.x);
+        __nv_bfloat162 k_pair23 = *reinterpret_cast<const __nv_bfloat162*>(&k_raw.y);
+        q_reg[0] = __bfloat162float(q_pair01.x) * kScaleConst;
+        q_reg[1] = __bfloat162float(q_pair01.y) * kScaleConst;
+        q_reg[2] = __bfloat162float(q_pair23.x) * kScaleConst;
+        q_reg[3] = __bfloat162float(q_pair23.y) * kScaleConst;
+        k_reg[0] = __bfloat162float(k_pair01.x);
+        k_reg[1] = __bfloat162float(k_pair01.y);
+        k_reg[2] = __bfloat162float(k_pair23.x);
+        k_reg[3] = __bfloat162float(k_pair23.y);
+    }
+
+    float v_reg[BV];
+    {
+        const __nv_bfloat16* v_ptr = v + i_nh * kVDim + i_v * BV;
+        if constexpr (BV == 8) {
+            const uint4 v_raw = *reinterpret_cast<const uint4*>(v_ptr);
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.x);
+            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.y);
+            __nv_bfloat162 v45 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.z);
+            __nv_bfloat162 v67 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.w);
+            v_reg[0] = __bfloat162float(v01.x);
+            v_reg[1] = __bfloat162float(v01.y);
+            v_reg[2] = __bfloat162float(v23.x);
+            v_reg[3] = __bfloat162float(v23.y);
+            v_reg[4] = __bfloat162float(v45.x);
+            v_reg[5] = __bfloat162float(v45.y);
+            v_reg[6] = __bfloat162float(v67.x);
+            v_reg[7] = __bfloat162float(v67.y);
+        } else if constexpr (BV == 4) {
+            const uint2 v_raw = *reinterpret_cast<const uint2*>(v_ptr);
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.x);
+            __nv_bfloat162 v23 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw.y);
+            v_reg[0] = __bfloat162float(v01.x);
+            v_reg[1] = __bfloat162float(v01.y);
+            v_reg[2] = __bfloat162float(v23.x);
+            v_reg[3] = __bfloat162float(v23.y);
+        } else if constexpr (BV == 2) {
+            const uint32_t v_raw = *reinterpret_cast<const uint32_t*>(v_ptr);
+            __nv_bfloat162 v01 = *reinterpret_cast<const __nv_bfloat162*>(&v_raw);
+            v_reg[0] = __bfloat162float(v01.x);
+            v_reg[1] = __bfloat162float(v01.y);
+        }
+    }
+
+    const float gate_sp = __logf(1.0f + exp_gate_x);
+    const float gate = __expf(neg_exp_A * gate_sp);
+    const float beta = __frcp_rn(1.0f + exp_neg_b);
+
+    __nv_bfloat16* out_ptr = out + i_nh * kVDim + i_v * BV;
+    float out_vals[BV];
+
+    if constexpr (BV == 8) {
+        h[0][0]*=gate; h[1][0]*=gate; h[2][0]*=gate; h[3][0]*=gate;
+        h[4][0]*=gate; h[5][0]*=gate; h[6][0]*=gate; h[7][0]*=gate;
+        h[0][1]*=gate; h[1][1]*=gate; h[2][1]*=gate; h[3][1]*=gate;
+        h[4][1]*=gate; h[5][1]*=gate; h[6][1]*=gate; h[7][1]*=gate;
+        h[0][2]*=gate; h[1][2]*=gate; h[2][2]*=gate; h[3][2]*=gate;
+        h[4][2]*=gate; h[5][2]*=gate; h[6][2]*=gate; h[7][2]*=gate;
+        h[0][3]*=gate; h[1][3]*=gate; h[2][3]*=gate; h[3][3]*=gate;
+        h[4][3]*=gate; h[5][3]*=gate; h[6][3]*=gate; h[7][3]*=gate;
+
+        float p0=0,p1=0,p2=0,p3=0,p4=0,p5=0,p6=0,p7=0;
+        p0=fmaf(k_reg[0],h[0][0],p0); p1=fmaf(k_reg[0],h[1][0],p1);
+        p2=fmaf(k_reg[0],h[2][0],p2); p3=fmaf(k_reg[0],h[3][0],p3);
+        p4=fmaf(k_reg[0],h[4][0],p4); p5=fmaf(k_reg[0],h[5][0],p5);
+        p6=fmaf(k_reg[0],h[6][0],p6); p7=fmaf(k_reg[0],h[7][0],p7);
+        p0=fmaf(k_reg[1],h[0][1],p0); p1=fmaf(k_reg[1],h[1][1],p1);
+        p2=fmaf(k_reg[1],h[2][1],p2); p3=fmaf(k_reg[1],h[3][1],p3);
+        p4=fmaf(k_reg[1],h[4][1],p4); p5=fmaf(k_reg[1],h[5][1],p5);
+        p6=fmaf(k_reg[1],h[6][1],p6); p7=fmaf(k_reg[1],h[7][1],p7);
+        p0=fmaf(k_reg[2],h[0][2],p0); p1=fmaf(k_reg[2],h[1][2],p1);
+        p2=fmaf(k_reg[2],h[2][2],p2); p3=fmaf(k_reg[2],h[3][2],p3);
+        p4=fmaf(k_reg[2],h[4][2],p4); p5=fmaf(k_reg[2],h[5][2],p5);
+        p6=fmaf(k_reg[2],h[6][2],p6); p7=fmaf(k_reg[2],h[7][2],p7);
+        p0=fmaf(k_reg[3],h[0][3],p0); p1=fmaf(k_reg[3],h[1][3],p1);
+        p2=fmaf(k_reg[3],h[2][3],p2); p3=fmaf(k_reg[3],h[3][3],p3);
+        p4=fmaf(k_reg[3],h[4][3],p4); p5=fmaf(k_reg[3],h[5][3],p5);
+        p6=fmaf(k_reg[3],h[6][3],p6); p7=fmaf(k_reg[3],h[7][3],p7);
+
+        warp_reduce_4(p0,p1,p2,p3);
+        warp_reduce_4(p4,p5,p6,p7);
+
+        const float dv0=beta*(v_reg[0]-p0); const float dv1=beta*(v_reg[1]-p1);
+        const float dv2=beta*(v_reg[2]-p2); const float dv3=beta*(v_reg[3]-p3);
+        const float dv4=beta*(v_reg[4]-p4); const float dv5=beta*(v_reg[5]-p5);
+        const float dv6=beta*(v_reg[6]-p6); const float dv7=beta*(v_reg[7]-p7);
+
+        h[0][0]=fmaf(dv0,k_reg[0],h[0][0]); h[1][0]=fmaf(dv1,k_reg[0],h[1][0]);
+        h[2][0]=fmaf(dv2,k_reg[0],h[2][0]); h[3][0]=fmaf(dv3,k_reg[0],h[3][0]);
+        h[4][0]=fmaf(dv4,k_reg[0],h[4][0]); h[5][0]=fmaf(dv5,k_reg[0],h[5][0]);
+        h[6][0]=fmaf(dv6,k_reg[0],h[6][0]); h[7][0]=fmaf(dv7,k_reg[0],h[7][0]);
+        h[0][1]=fmaf(dv0,k_reg[1],h[0][1]); h[1][1]=fmaf(dv1,k_reg[1],h[1][1]);
+        h[2][1]=fmaf(dv2,k_reg[1],h[2][1]); h[3][1]=fmaf(dv3,k_reg[1],h[3][1]);
+        h[4][1]=fmaf(dv4,k_reg[1],h[4][1]); h[5][1]=fmaf(dv5,k_reg[1],h[5][1]);
+        h[6][1]=fmaf(dv6,k_reg[1],h[6][1]); h[7][1]=fmaf(dv7,k_reg[1],h[7][1]);
+        h[0][2]=fmaf(dv0,k_reg[2],h[0][2]); h[1][2]=fmaf(dv1,k_reg[2],h[1][2]);
+        h[2][2]=fmaf(dv2,k_reg[2],h[2][2]); h[3][2]=fmaf(dv3,k_reg[2],h[3][2]);
+        h[4][2]=fmaf(dv4,k_reg[2],h[4][2]); h[5][2]=fmaf(dv5,k_reg[2],h[5][2]);
+        h[6][2]=fmaf(dv6,k_reg[2],h[6][2]); h[7][2]=fmaf(dv7,k_reg[2],h[7][2]);
+        h[0][3]=fmaf(dv0,k_reg[3],h[0][3]); h[1][3]=fmaf(dv1,k_reg[3],h[1][3]);
+        h[2][3]=fmaf(dv2,k_reg[3],h[2][3]); h[3][3]=fmaf(dv3,k_reg[3],h[3][3]);
+        h[4][3]=fmaf(dv4,k_reg[3],h[4][3]); h[5][3]=fmaf(dv5,k_reg[3],h[5][3]);
+        h[6][3]=fmaf(dv6,k_reg[3],h[6][3]); h[7][3]=fmaf(dv7,k_reg[3],h[7][3]);
+
+        float o0=0,o1=0,o2=0,o3=0,o4=0,o5=0,o6=0,o7=0;
+        o0=fmaf(q_reg[0],h[0][0],o0); o1=fmaf(q_reg[0],h[1][0],o1);
+        o2=fmaf(q_reg[0],h[2][0],o2); o3=fmaf(q_reg[0],h[3][0],o3);
+        o4=fmaf(q_reg[0],h[4][0],o4); o5=fmaf(q_reg[0],h[5][0],o5);
+        o6=fmaf(q_reg[0],h[6][0],o6); o7=fmaf(q_reg[0],h[7][0],o7);
+        o0=fmaf(q_reg[1],h[0][1],o0); o1=fmaf(q_reg[1],h[1][1],o1);
+        o2=fmaf(q_reg[1],h[2][1],o2); o3=fmaf(q_reg[1],h[3][1],o3);
+        o4=fmaf(q_reg[1],h[4][1],o4); o5=fmaf(q_reg[1],h[5][1],o5);
+        o6=fmaf(q_reg[1],h[6][1],o6); o7=fmaf(q_reg[1],h[7][1],o7);
+        o0=fmaf(q_reg[2],h[0][2],o0); o1=fmaf(q_reg[2],h[1][2],o1);
+        o2=fmaf(q_reg[2],h[2][2],o2); o3=fmaf(q_reg[2],h[3][2],o3);
+        o4=fmaf(q_reg[2],h[4][2],o4); o5=fmaf(q_reg[2],h[5][2],o5);
+        o6=fmaf(q_reg[2],h[6][2],o6); o7=fmaf(q_reg[2],h[7][2],o7);
+        o0=fmaf(q_reg[3],h[0][3],o0); o1=fmaf(q_reg[3],h[1][3],o1);
+        o2=fmaf(q_reg[3],h[2][3],o2); o3=fmaf(q_reg[3],h[3][3],o3);
+        o4=fmaf(q_reg[3],h[4][3],o4); o5=fmaf(q_reg[3],h[5][3],o5);
+        o6=fmaf(q_reg[3],h[6][3],o6); o7=fmaf(q_reg[3],h[7][3],o7);
+
+        warp_reduce_4(o0,o1,o2,o3);
+        warp_reduce_4(o4,o5,o6,o7);
+
+        out_vals[0]=o0; out_vals[1]=o1; out_vals[2]=o2; out_vals[3]=o3;
+        out_vals[4]=o4; out_vals[5]=o5; out_vals[6]=o6; out_vals[7]=o7;
+
+#pragma unroll
+        for (int row = 0; row < 8; ++row) {
+            const int v_idx = i_v * 8 + row;
+            const float4 sv = {h[row][0], h[row][1], h[row][2], h[row][3]};
+            __stcs(reinterpret_cast<float4*>(new_state + state_base + v_idx * kHeadSize + k_base), sv);
+        }
+    } else if constexpr (BV == 4) {
+        h[0][0]*=gate; h[1][0]*=gate; h[2][0]*=gate; h[3][0]*=gate;
+        h[0][1]*=gate; h[1][1]*=gate; h[2][1]*=gate; h[3][1]*=gate;
+        h[0][2]*=gate; h[1][2]*=gate; h[2][2]*=gate; h[3][2]*=gate;
+        h[0][3]*=gate; h[1][3]*=gate; h[2][3]*=gate; h[3][3]*=gate;
+
+        float p0=0,p1=0,p2=0,p3=0;
+        p0=fmaf(k_reg[0],h[0][0],p0); p1=fmaf(k_reg[0],h[1][0],p1);
+        p2=fmaf(k_reg[0],h[2][0],p2); p3=fmaf(k_reg[0],h[3][0],p3);
+        p0=fmaf(k_reg[1],h[0][1],p0); p1=fmaf(k_reg[1],h[1][1],p1);
+        p2=fmaf(k_reg[1],h[2][1],p2); p3=fmaf(k_reg[1],h[3][1],p3);
+        p0=fmaf(k_reg[2],h[0][2],p0); p1=fmaf(k_reg[2],h[1][2],p1);
+        p2=fmaf(k_reg[2],h[2][2],p2); p3=fmaf(k_reg[2],h[3][2],p3);
+        p0=fmaf(k_reg[3],h[0][3],p0); p1=fmaf(k_reg[3],h[1][3],p1);
+        p2=fmaf(k_reg[3],h[2][3],p2); p3=fmaf(k_reg[3],h[3][3],p3);
+
+        warp_reduce_4(p0,p1,p2,p3);
+
+        const float dv0=beta*(v_reg[0]-p0); const float dv1=beta*(v_reg[1]-p1);
+        const float dv2=beta*(v_reg[2]-p2); const float dv3=beta*(v_reg[3]-p3);
+
+        h[0][0]=fmaf(dv0,k_reg[0],h[0][0]); h[1][0]=fmaf(dv1,k_reg[0],h[1][0]);
+        h[2][0]=fmaf(dv2,k_reg[0],h[2][0]); h[3][0]=fmaf(dv3,k_reg[0],h[3][0]);
+        h[0][1]=fmaf(dv0,k_reg[1],h[0][1]); h[1][1]=fmaf(dv1,k_reg[1],h[1][1]);
+        h[2][1]=fmaf(dv2,k_reg[1],h[2][1]); h[3][1]=fmaf(dv3,k_reg[1],h[3][1]);
+        h[0][2]=fmaf(dv0,k_reg[2],h[0][2]); h[1][2]=fmaf(dv1,k_reg[2],h[1][2]);
+        h[2][2]=fmaf(dv2,k_reg[2],h[2][2]); h[3][2]=fmaf(dv3,k_reg[2],h[3][2]);
+        h[0][3]=fmaf(dv0,k_reg[3],h[0][3]); h[1][3]=fmaf(dv1,k_reg[3],h[1][3]);
+        h[2][3]=fmaf(dv2,k_reg[3],h[2][3]); h[3][3]=fmaf(dv3,k_reg[3],h[3][3]);
+
+        float o0=0,o1=0,o2=0,o3=0;
+        o0=fmaf(q_reg[0],h[0][0],o0); o1=fmaf(q_reg[0],h[1][0],o1);
+        o2=fmaf(q_reg[0],h[2][0],o2); o3=fmaf(q_reg[0],h[3][0],o3);
+        o0=fmaf(q_reg[1],h[0][1],o0); o1=fmaf(q_reg[1],h[1][1],o1);
+        o2=fmaf(q_reg[1],h[2][1],o2); o3=fmaf(q_reg[1],h[3][1],o3);
+        o0=fmaf(q_reg[2],h[0][2],o0); o1=fmaf(q_reg[2],h[1][2],o1);
+        o2=fmaf(q_reg[2],h[2][2],o2); o3=fmaf(q_reg[2],h[3][2],o3);
+        o0=fmaf(q_reg[3],h[0][3],o0); o1=fmaf(q_reg[3],h[1][3],o1);
+        o2=fmaf(q_reg[3],h[2][3],o2); o3=fmaf(q_reg[3],h[3][3],o3);
+
+        warp_reduce_4(o0,o1,o2,o3);
+
+        out_vals[0]=o0; out_vals[1]=o1; out_vals[2]=o2; out_vals[3]=o3;
+
+#pragma unroll
+        for (int row = 0; row < 4; ++row) {
+            const int v_idx = i_v * 4 + row;
+            const float4 sv = {h[row][0], h[row][1], h[row][2], h[row][3]};
+            __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx*kHeadSize+k_base), sv);
+        }
+    } else {
+        h[0][0]*=gate; h[1][0]*=gate;
+        h[0][1]*=gate; h[1][1]*=gate;
+        h[0][2]*=gate; h[1][2]*=gate;
+        h[0][3]*=gate; h[1][3]*=gate;
+
+        float p0=0,p1=0;
+        p0=fmaf(k_reg[0],h[0][0],p0); p1=fmaf(k_reg[0],h[1][0],p1);
+        p0=fmaf(k_reg[1],h[0][1],p0); p1=fmaf(k_reg[1],h[1][1],p1);
+        p0=fmaf(k_reg[2],h[0][2],p0); p1=fmaf(k_reg[2],h[1][2],p1);
+        p0=fmaf(k_reg[3],h[0][3],p0); p1=fmaf(k_reg[3],h[1][3],p1);
+
+        warp_reduce_2(p0,p1);
+        const float dv0=beta*(v_reg[0]-p0);
+        const float dv1=beta*(v_reg[1]-p1);
+
+        h[0][0]=fmaf(dv0,k_reg[0],h[0][0]); h[1][0]=fmaf(dv1,k_reg[0],h[1][0]);
+        h[0][1]=fmaf(dv0,k_reg[1],h[0][1]); h[1][1]=fmaf(dv1,k_reg[1],h[1][1]);
+        h[0][2]=fmaf(dv0,k_reg[2],h[0][2]); h[1][2]=fmaf(dv1,k_reg[2],h[1][2]);
+        h[0][3]=fmaf(dv0,k_reg[3],h[0][3]); h[1][3]=fmaf(dv1,k_reg[3],h[1][3]);
+
+        float o0=0,o1=0;
+        o0=fmaf(q_reg[0],h[0][0],o0); o1=fmaf(q_reg[0],h[1][0],o1);
+        o0=fmaf(q_reg[1],h[0][1],o0); o1=fmaf(q_reg[1],h[1][1],o1);
+        o0=fmaf(q_reg[2],h[0][2],o0); o1=fmaf(q_reg[2],h[1][2],o1);
+        o0=fmaf(q_reg[3],h[0][3],o0); o1=fmaf(q_reg[3],h[1][3],o1);
+
+        warp_reduce_2(o0,o1);
+        out_vals[0]=o0; out_vals[1]=o1;
+
+        const int v_idx0 = i_v * 2, v_idx1 = v_idx0 + 1;
+        const float4 sv0 = {h[0][0], h[0][1], h[0][2], h[0][3]};
+        const float4 sv1 = {h[1][0], h[1][1], h[1][2], h[1][3]};
+        __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx0*kHeadSize+k_base), sv0);
+        __stcs(reinterpret_cast<float4*>(new_state+state_base+v_idx1*kHeadSize+k_base), sv1);
+    }
+
+    if (tid < BV) {
+        out_ptr[tid] = __float2bfloat16_rn(out_vals[tid]);
+    }
+}
+
 #ifndef TORCH_EXTENSION_NAME
 int main() {
     constexpr int B = 1;
@@ -591,7 +893,7 @@ int main() {
     dim3 threads_per_block(kWarpSize);
     if (B == 1) {
         dim3 grid_size(kVDim / kSmallVTileRows, B * kNumVHeads);
-        gdn_v4<kSmallVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+        gdn_v5<kSmallVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
             q,
             k,
             v,
@@ -609,9 +911,9 @@ int main() {
             V,
             scale
         );
-    } else if (B <= 4) {
+    } else if (B <= 2) {
         dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
-        gdn_v4<kMediumVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+        gdn_v5<kMediumVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
             q,
             k,
             v,
@@ -630,8 +932,8 @@ int main() {
             scale
         );
     } else {
-        dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
-        gdn_v4<kMediumVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
+        dim3 grid_size(kVDim / kLargeVTileRows, B * kNumVHeads);
+        gdn_v5<kLargeVTileRows><<<grid_size, threads_per_block, 0, nullptr>>>(
             q,
             k,
             v,
@@ -739,8 +1041,8 @@ void launch_gdn(
             scale
         );
     } else {
-        dim3 grid_size(kVDim / kMediumVTileRows, B * kNumVHeads);
-        gdn_v4<kMediumVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
+        dim3 grid_size(kVDim / kLargeVTileRows, B * kNumVHeads);
+        gdn_v5<kLargeVTileRows><<<grid_size, threads_per_block, 0, stream.stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),

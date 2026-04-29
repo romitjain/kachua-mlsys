@@ -1,6 +1,6 @@
-# Expects repo venv at ../.venv; override PYTHON= if different.
+# Expects repo venv at ../.venv; override PYTHON/MODAL if different.
 PYTHON ?= ../.venv/bin/python
-MODAL ?= modal
+MODAL ?= ../.venv/bin/modal
 NCU ?= ncu --set detailed --target-processes all --launch-skip 6 --launch-count 1 --kernel-name-base function --kernel-name "regex:^gdn_.*"
 NCU_UI ?= ncu-ui
 INPUT ?= solution/cuda/kernel.cu

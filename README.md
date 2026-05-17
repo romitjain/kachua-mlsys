@@ -86,6 +86,22 @@ Edit `solution/cuda/kernel.cu` and `solution/cuda/binding.py` with your implemen
 
 ## Development Workflow
 
+### Prefill Experiment Records
+
+The last GDN prefill experiment batch is archived in the repository so future
+optimization runs can start from the same evidence instead of rediscovering the
+same rejected paths.
+
+- `docs/program.md` describes the autonomous experiment loop, in-scope files,
+  Modal B200 commands, and result logging format.
+- `gdn_prefill_qk4_v8_d128_k_last/solution/triton/experiment_log.md` records
+  the prefill experiment hypotheses, measurements, kept changes, and reverts.
+- `gdn_prefill_qk4_v8_d128_k_last/solution/triton/results.csv` keeps the compact
+  accepted-results table for the campaign.
+
+Use those files together when continuing prefill work: the CSV tells you what
+won, while the experiment log explains why nearby alternatives were rejected.
+
 ### Pack Your Solution
 
 Generate `solution.json` from your source files:
@@ -131,12 +147,23 @@ To submit your solution for evaluation:
 3. Commit and push your changes
 4. Tag your commit for evaluation (e.g., `git tag submission-v1`)
 
+The current submission report for the full contest submission is available at
+`docs/submission-report.pdf`.
+
 ## Project Structure
 
 ```
 flashinfer-bench-starter-kit/
 ├── README.md                    # This file
+├── docs/
+│   ├── program.md               # Experiment automation guide
+│   └── submission-report.pdf    # Current submission report
 ├── config.toml                  # Track configuration (edit this)
+├── gdn_prefill_qk4_v8_d128_k_last/
+│   └── solution/triton/
+│       ├── experiment_log.md    # Prefill experiment notes and decisions
+│       ├── results.csv          # Accepted prefill experiment results
+│       └── kernel.py            # Prefill Triton kernel
 ├── solution/                    # Solution source files
 │   ├── triton/                  # Triton implementation
 │   │   └── kernel.py           # Your Triton kernel

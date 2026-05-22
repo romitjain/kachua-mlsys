@@ -1,44 +1,72 @@
-# [FlashInfer AI Kernel Generation Contest @ MLSys 2026](http://mlsys26.flashinfer.ai/)
+# Kachua MLSys GDN Kernels
 
-Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
+This repository contains optimized Gated Delta Network (GDN) kernels for the MLSys 2026 FlashInfer AI Kernel Generation Contest, targeting NVIDIA B200.
 
----
+There are two active definitions:
 
-<p align="center">
-  <a href="https://www.nvidia.com"><img src="images/nvidia-logo.svg" alt="NVIDIA" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://modal.com"><img src="images/modal-logo.png" alt="Modal" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://mlsys.org"><img src="images/mlsys-logo.svg" alt="MLSys" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer"><img src="images/flashinfer-logo.png" alt="FlashInfer" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer-bench"><img src="images/fib_logo.png" alt="FlashInfer-Bench" height="50"/></a>
-</p>
+| Definition | Active backend | Entry point | Main kernel |
+|---|---:|---|---|
+| `gdn_prefill_qk4_v8_d128_k_last` | Triton | `kernel.py::launch_gdn` | `gdn_prefill_qk4_v8_d128_k_last/solution/triton/kernel.py` |
+| `gdn_decode_qk4_v8_d128_k_last` | CUDA | `kernel.cu::launch_gdn` | `gdn_decode_qk4_v8_d128_k_last/solution/cuda/kernel.cu` |
 
----
+## Repository Structure
 
-[FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
+```text
+.
+├── gdn_prefill_qk4_v8_d128_k_last/
+│   ├── config.toml
+│   ├── scripts/
+│   └── solution/
+│       ├── reference_torch_impl.py
+│       └── triton/
+│           └── kernel.py
+├── gdn_decode_qk4_v8_d128_k_last/
+│   ├── config.toml
+│   ├── scripts/
+│   └── solution/
+│       ├── reference_torch_impl.py
+│       ├── cuda/
+│       │   ├── kernel.cu
+│       │   └── binding.py
+│       └── triton/
+│           └── kernel.py
+├── docs/
+│   ├── program.md
+│   ├── submission-report.pdf
+│   └── kachua_mlsys26_presentation.pdf
+├── EVALUATION.md
+├── FAQ.md
+└── ORIGINAL_README.md
+```
 
-## Competition Tracks
+Each definition directory is self-contained. Its `config.toml` selects the backend, entry point, solution name, and contest definition.
 
-The competition features three tracks, each targeting a critical LLM operation:
+## Kernel Summary
 
-| Track | Description |
-|-------|-------------|
-| **fused_moe** | Fused Mixture-of-Experts kernel for efficient expert routing and computation |
-| **sparse_attention** | Sparse attention mechanisms for long-context inference |
-| **gated_delta_net** | Gated delta network operations for efficient state updates |
+### Prefill Triton
 
-**Fork this template once per track** you want to compete in (separate repos for each track).
+The prefill kernel processes multiple prompt tokens using chunked recurrence blocks. It dispatches between three live paths:
 
-## Getting Started
+- `Direct v2`: one Triton launch; each BV state-row tile recomputes token-side chunk work.
+- `Split-WY`: prepass computes reusable chunk metadata, then a consumer applies it across BV state-row tiles.
+- `Flat-WY`: many-sequence variant that flattens chunks into records for denser prepass parallelism.
 
-### 1. Fork This Template
+The two key tiling axes are:
 
-Click "Use this template" or fork this repository to create your solution repo.
+```text
+CHUNK -> number of tokens grouped into one local recurrence solve
+BV    -> number of state/output rows updated by one Triton program
+```
 
-### 2. Install Dependencies
+### Decode CUDA
+
+The active decode submission is CUDA. Decode handles one token at a time, so the state transition is a rank-1-style update from single-token `q`, `k`, and `v` vectors. The current CUDA path focuses on low-latency single-token execution with vectorized state loads, compact gate/update math, and direct binding through the configured CUDA entry point.
+
+Historical Triton decode kernels and notes remain under `gdn_decode_qk4_v8_d128_k_last/solution/triton/`.
+
+## Setup
+
+Install the FlashInfer benchmark tools and Modal:
 
 ```bash
 conda create -n fi-bench python=3.12
@@ -46,209 +74,82 @@ conda activate fi-bench
 pip install flashinfer-bench modal
 ```
 
-### 3. Download the TraceSet
-
-We provide kernel definitions and workloads in [FlashInfer-Trace format](https://bench.flashinfer.ai/docs/flashinfer-trace). Clone the competition dataset from HuggingFace:
+Download the contest dataset:
 
 ```bash
 git lfs install
+# Download the contest traces and definitions
 git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
+export FIB_DATASET_PATH=/path/to/mlsys26-contest
 ```
 
-Set the environment variable:
-
-```bash
-export FIB_DATASET_PATH=/path/to/flashinfer-trace
-```
-
-### 4. Configure Your Solution
-
-Edit `config.toml` to set your track and team info:
-
-```toml
-[solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
-
-[build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
-```
-
-### 5. Implement Your Kernel
-
-**For Triton:**
-Edit `solution/triton/kernel.py` with your implementation.
-
-**For CUDA:**
-Edit `solution/cuda/kernel.cu` and `solution/cuda/binding.py` with your implementation.
-
-## Development Workflow
-
-### Prefill Experiment Records
-
-The last GDN prefill experiment batch is archived in the repository so future
-optimization runs can start from the same evidence instead of rediscovering the
-same rejected paths.
-
-- `docs/program.md` describes the autonomous experiment loop, in-scope files,
-  Modal B200 commands, and result logging format.
-- `gdn_prefill_qk4_v8_d128_k_last/solution/triton/experiment_log.md` records
-  the prefill experiment hypotheses, measurements, kept changes, and reverts.
-- `gdn_prefill_qk4_v8_d128_k_last/solution/triton/results.csv` keeps the compact
-  accepted-results table for the campaign.
-
-Use those files together when continuing prefill work: the CSV tells you what
-won, while the experiment log explains why nearby alternatives were rejected.
-
-### Pack Your Solution
-
-Generate `solution.json` from your source files:
-
-```bash
-python scripts/pack_solution.py
-```
-
-### Run Local Benchmarks
-
-Test your solution on your local GPU:
-
-```bash
-python scripts/run_local.py
-```
-
-Requires: Local CUDA-capable GPU and `FIB_DATASET_PATH` environment variable.
-
-### Run Cloud Benchmarks (Modal)
-
-Test your solution on NVIDIA B200 GPUs via Modal:
-
-**One-time setup:**
+For Modal runs:
 
 ```bash
 modal setup
 modal volume create flashinfer-trace
-modal volume put flashinfer-trace /path/to/flashinfer-trace
+modal volume put flashinfer-trace /path/to/mlsys26-contest
 ```
 
-**Run benchmark:**
+## Running
+
+Run commands from the definition directory you want to evaluate.
+
+Prefill:
 
 ```bash
+cd gdn_prefill_qk4_v8_d128_k_last
+
+# Run the FlashInfer-Bench path on a local GPU
+python scripts/run_local.py
+# Run the preferred Modal GPU-timing benchmark
+modal run scripts/bench_fi_timing_modal.py
+
+# Run the standard Modal benchmark
 modal run scripts/run_modal.py
+# Run the Modal profiling workflow
+modal run scripts/profile_modal.py
 ```
 
-## Submission
+Decode:
 
-To submit your solution for evaluation:
+```bash
+cd gdn_decode_qk4_v8_d128_k_last
 
-1. Ensure your implementation is complete and tested
-2. Run `python scripts/pack_solution.py` to generate `solution.json`
-3. Commit and push your changes
-4. Tag your commit for evaluation (e.g., `git tag submission-v1`)
+# Run the FlashInfer-Bench path on a local GPU
+python scripts/run_local.py
+# Run the preferred Modal GPU-timing benchmark
+modal run scripts/bench_fi_timing_modal.py
 
-The current submission report for the full contest submission is available at
-`docs/submission-report.pdf`.
-
-## Project Structure
-
-```
-flashinfer-bench-starter-kit/
-├── README.md                    # This file
-├── docs/
-│   ├── program.md               # Experiment automation guide
-│   └── submission-report.pdf    # Current submission report
-├── config.toml                  # Track configuration (edit this)
-├── gdn_prefill_qk4_v8_d128_k_last/
-│   └── solution/triton/
-│       ├── experiment_log.md    # Prefill experiment notes and decisions
-│       ├── results.csv          # Accepted prefill experiment results
-│       └── kernel.py            # Prefill Triton kernel
-├── solution/                    # Solution source files
-│   ├── triton/                  # Triton implementation
-│   │   └── kernel.py           # Your Triton kernel
-│   └── cuda/                    # CUDA implementation
-│       ├── kernel.cu           # Your CUDA kernel
-│       └── binding.py          # TVM FFI bindings
-├── scripts/                     # Utility scripts
-│   ├── run_local.py            # Local benchmark runner
-│   ├── run_modal.py            # Modal cloud benchmark runner
-│   └── pack_solution.py        # Pack source files into solution.json
-└── images/                      # Sponsor logos
+# Run the standard Modal benchmark
+modal run scripts/run_modal.py
+# Run the Modal profiling workflow
+modal run scripts/profile_modal.py
 ```
 
-## Additional Resources
+`bench_fi_timing_modal.py` is the preferred quick benchmark path because it uses GPU kernel timing that better matches the contest evaluation signal.
 
-### Solution Handling API
+## Packing
 
-```python
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files, extract_solution_to_files
+Pack the active solution for a definition:
 
-# Pack source files into a Solution object
-spec = BuildSpec(
-    language="triton",  # or "cuda"
-    target_hardware=["cuda"],
-    entry_point="my_kernel",
-)
-solution = pack_solution_from_files(
-    path="./my_solution_dir",
-    spec=spec,
-    name="my_solution_v1",
-    definition="fused_moe",
-    author="your_name",
-)
-
-# Extract a Solution to files in a working directory
-extract_solution_to_files(solution, "./output_dir")
+```bash
+cd gdn_prefill_qk4_v8_d128_k_last
+python scripts/pack_solution.py
 ```
 
-### Running Sanitizers
+or:
 
-```python
-from flashinfer_bench.agents import flashinfer_bench_run_sanitizer
-
-output = flashinfer_bench_run_sanitizer(
-    solution=solution,
-    workload=workload,
-    sanitizer_types=["memcheck", "racecheck", "synccheck", "initcheck"],
-    timeout=300,
-)
-print(output)
+```bash
+cd gdn_decode_qk4_v8_d128_k_last
+python scripts/pack_solution.py
 ```
 
-### NCU Profiling
+This writes `solution.json` inside that definition directory using its local `config.toml`.
 
-```python
-from flashinfer_bench.agents import flashinfer_bench_run_ncu
+## Useful References
 
-output = flashinfer_bench_run_ncu(
-    solution=solution,
-    workload=workload,
-    set="detailed",
-    page="details",
-    timeout=120,
-)
-print(output)
-```
-
-### List Available Tools
-
-```python
-from flashinfer_bench.agents import get_all_tool_schemas
-
-schemas = get_all_tool_schemas()
-# Returns list of OpenAI-compatible function schemas
-```
-
-## Notes
-
-### Kernel Signature Requirements
-
-When implementing kernels using Destination Passing Style (DPS), ensure you specify the kernel signature type in your `BuildSpec` and adjust the build configuration accordingly.
-
-**Important:** Avoid using variadic input arguments in your kernel signatures, as they will fail the builder validation check.
-
-### CUDA Kernel Bindings
-
-For CUDA kernel implementations, we recommend using [TVM FFI](https://tvm.apache.org/ffi/) for Python bindings. The `flashinfer_bench.agents` module provides TVM FFI agent instruction prompts to assist with development.
+- [docs/program.md](docs/program.md): Auto research workflow
+- [docs/submission-report.pdf](docs/submission-report.pdf): Technical writeup.
+- [docs/kachua_mlsys26_presentation.pdf](docs/kachua_mlsys26_presentation.pdf): Presentation for MLSys 26.
+- [ORIGINAL_README.md](ORIGINAL_README.md): original FlashInfer contest starter README.

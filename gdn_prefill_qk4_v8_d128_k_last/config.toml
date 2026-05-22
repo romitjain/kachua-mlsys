@@ -1,8 +1,9 @@
 [solution]
-name = "gdn-prefill-triton-v2"
+name = "gdn-prefill-cuda-v1"
 definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "kachua"
 
 [build]
-language = "triton"
-entry_point = "kernel.py::launch_gdn"
+language = "cuda"
+entry_point = "kernel.cu::launch_gdn"
+binding = "torch"
